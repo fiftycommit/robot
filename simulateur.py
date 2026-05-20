@@ -3,6 +3,10 @@
 import pygame
 import math
 import sys
+import argparse
+import socket
+import json
+import time
 import mock_strategie as commande
 import test_strategie as strategie
 
@@ -44,6 +48,16 @@ obstacle = {'x_cm': 200.0, 'y_cm': 150.0}
 
 # Pour le drag & drop de l'obstacle
 drag_obstacle = False
+
+parser = argparse.ArgumentParser(description="Simulateur IA Robot")
+parser.add_argument("--send-camera", action="store_true",
+                    help="Send camera-like UDP state to robot")
+parser.add_argument("--robot-ip", default="127.0.0.1",
+                    help="IP to send camera state to")
+parser.add_argument("--port", type=int, default=8081)
+parser.add_argument("--send-fps", type=float, default=10.0,
+                    help="Fréquence d'envoi UDP (Hz)")
+args = parser.parse_args()
 
 pygame.init()
 screen = pygame.display.set_mode((WIN_W, WIN_H))
@@ -208,6 +222,16 @@ def update_robot(dt, etat_cmd):
 running = True
 drag_obstacle = False
 
+# Socket UDP optionnelle pour envoyer l'etat comme un serveur vision
+if args.send_camera:
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    except Exception as exc:
+        print(f"[simulateur] impossible de creer socket UDP: {exc}")
+        sock = None
+    last_send = 0.0
+
 while running:
     dt = clock.tick(FPS) / 1000.0
 
@@ -256,6 +280,28 @@ while running:
 
     # --- Simulation physique ---
     update_robot(dt, etat_cmd)
+
+    # --- Envoi UDP optionnel de l'etat (meme format que vision_server) ---
+    if args.send_camera and sock is not None:
+        now = time.time()
+        if now - last_send >= 1.0 / float(max(0.001, args.send_fps)):
+            state = {
+                'ts': now,
+                'robot': {
+                    'x_cm': float(robot['x_cm']),
+                    'y_cm': float(robot['y_cm']),
+                    'angle_deg': float(robot['angle']),
+                },
+                'ball': {
+                    'x_cm': float(balle['x_cm']),
+                    'y_cm': float(balle['y_cm']),
+                }
+            }
+            try:
+                sock.sendto(json.dumps(state).encode('utf-8'), (args.robot_ip, args.port))
+            except Exception as exc:
+                print(f"[simulateur] erreur envoi UDP: {exc}")
+            last_send = now
 
     # --- Rendu ---
     draw_arena()

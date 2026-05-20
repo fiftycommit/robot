@@ -30,6 +30,8 @@ import time
 import socket
 import json
 import math
+import mock_strategie as commande
+import test_strategie as strategie
 from ev3dev2.motor import LargeMotor, Motor, OUTPUT_A, OUTPUT_C, OUTPUT_D
 from ev3dev2.sensor.lego import UltrasonicSensor
 from ev3dev2.sensor import INPUT_3
@@ -89,6 +91,9 @@ CAMERA_CONTACT_DIST = 23.0
 CAMERA_APPROACH_DIST = 80.0
 CAMERA_SLOW_SPEED = 22
 CAMERA_TURN_SPEED = 22
+ULTRASON_OBSTACLE_MAX_DIST = OBSTACLE_DIST
+ULTRASON_BALL_MATCH_TOLERANCE = 12.0
+VIRTUAL_OBSTACLE_FAR_CM = 9999.0
  
 # ── Etat des touches ─────────────────────────────────────────────────────────
 keys = {
@@ -266,46 +271,78 @@ def get_fresh_camera_state():
         return None
     return state
 
-def camera_auto_step(state, d, now):
-    global camera_last_shot, camera_escape_dir
+def build_strategy_state(camera_state, distance):
+    """Convertit vision + ultrason vers le format de test_strategie."""
+    vision_robot = camera_state["robot"]
+    vision_ball = camera_state["ball"]
 
-    robot = state["robot"]
-    ball = state["ball"]
-    dx = ball["x_cm"] - robot["x_cm"]
-    dy = ball["y_cm"] - robot["y_cm"]
-    ball_dist = math.hypot(dx, dy)
-    target_angle = math.degrees(math.atan2(dy, dx))
-    diff = angle_diff(target_angle, robot.get("angle_deg", 0.0))
+    robot = {
+        "x_cm": float(vision_robot["x_cm"]),
+        "y_cm": float(vision_robot["y_cm"]),
+        "angle": float(vision_robot.get("angle_deg", 0.0)),
+    }
+    ball = {
+        "x_cm": float(vision_ball["x_cm"]),
+        "y_cm": float(vision_ball["y_cm"]),
+    }
 
-    if d <= OBSTACLE_DIST and ball_dist > CAMERA_APPROACH_DIST:
+    obstacle = {
+        "x_cm": VIRTUAL_OBSTACLE_FAR_CM,
+        "y_cm": VIRTUAL_OBSTACLE_FAR_CM,
+    }
+
+    if is_valid_distance(distance) and distance <= ULTRASON_OBSTACLE_MAX_DIST:
+        dx_ball = ball["x_cm"] - robot["x_cm"]
+        dy_ball = ball["y_cm"] - robot["y_cm"]
+        ball_dist = math.hypot(dx_ball, dy_ball)
+        ball_angle = math.degrees(math.atan2(dy_ball, dx_ball))
+        ball_in_front = abs(angle_diff(ball_angle, robot["angle"])) <= strategie.ANGLE_DETECTION
+        ultrason_matches_ball = (
+            ball_in_front and
+            abs(ball_dist - distance) <= ULTRASON_BALL_MATCH_TOLERANCE
+        )
+
+        if not ultrason_matches_ball:
+            rad = math.radians(robot["angle"])
+            obstacle = {
+                "x_cm": robot["x_cm"] + math.cos(rad) * distance,
+                "y_cm": robot["y_cm"] + math.sin(rad) * distance,
+            }
+
+    return robot, ball, obstacle
+
+def apply_strategy_command(cmd, now):
+    """Applique une commande mock_strategie sur les vrais moteurs EV3."""
+    global camera_last_shot
+
+    action = cmd.get("action", "stop")
+    vitesse = int(cmd.get("vitesse", 0))
+
+    if action == "avance":
+        drive(vitesse, vitesse)
+    elif action == "recule":
+        drive(-vitesse, -vitesse)
+    elif action == "tourneD":
+        drive(vitesse, -vitesse)
+    elif action == "tourneG":
+        drive(-vitesse, vitesse)
+    elif action == "tir":
         stop()
-        print("\r\n[CAMERA] obstacle ultrason devant, balle ailleurs - securite")
-        return False
-
-    if ball_dist <= CAMERA_CONTACT_DIST and now - camera_last_shot >= SHOT_COOLDOWN:
-        stop()
-        print("\r\n[CAMERA] balle au contact ({:.1f}cm) - TIR".format(ball_dist))
-        scoop()
-        time.sleep(POST_SHOT_CHECK_TIME)
-        after_shot_d = read_distance()
-        camera_last_shot = time.time()
-        if after_shot_d <= DETECT_DIST:
-            print("\r\n[CAMERA] objet encore devant apres tir ({:.1f}cm) - RECUL + SCAN".format(
-                after_shot_d))
-            camera_escape_dir, _ = recover_from_obstacle(1, camera_escape_dir)
-        return True
-
-    if abs(diff) > CAMERA_ANGLE_OK:
-        if diff > 0:
-            drive(CAMERA_TURN_SPEED, -CAMERA_TURN_SPEED)
-        else:
-            drive(-CAMERA_TURN_SPEED, CAMERA_TURN_SPEED)
+        if now - camera_last_shot >= SHOT_COOLDOWN:
+            print("\r\n[STRATEGIE] TIR")
+            scoop()
+            camera_last_shot = time.time()
+        commande.stop()
     else:
-        speed = CAMERA_SLOW_SPEED if ball_dist <= DETECT_DIST else DRIVE_SPEED
-        drive(speed, speed)
+        stop()
 
+def camera_auto_step(state, d, now):
+    robot, ball, obstacle = build_strategy_state(state, d)
+    strategie.jouer_tour(robot, ball, obstacle)
+    cmd = commande.get_etat()
+    apply_strategy_command(cmd, now)
     return True
- 
+
 # ── Thread lecture clavier ────────────────────────────────────────────────────
  
 KEY_TIMEOUT = 0.15  # secondes - si pas de touche recue, on considere relachee
@@ -398,8 +435,11 @@ def read_keys():
             elif ch == 'a':
                 auto_mode = not auto_mode
                 if auto_mode:
+                    strategie.reset()
+                    commande.stop()
                     print("\r-> Mode AUTO ON       ", end='')
                 else:
+                    commande.stop()
                     print("\r-> Mode AUTO OFF      ", end='')
             elif ch == 'x':
                 for k in keys:
