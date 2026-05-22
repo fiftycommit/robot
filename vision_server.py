@@ -8,9 +8,12 @@ Analyse camera cote PC:
 - affiche le flux annote
 - diffuse les positions en UDP JSON vers le robot sur le port 8081
 
-Detection:
-  robot = ArUco ID 67
-  balle = objet rouge ou bleu
+Optimisations:
+  - detection ArUco multi-echelle (image originale + upscale x2 si pas trouve)
+  - parametres ArUco permissifs pour petits marqueurs
+  - preprocessing CLAHE leger
+  - lissage temporel (memoire robot 1.2s)
+  - drain socket UDP
 """
 
 import argparse
@@ -22,7 +25,6 @@ import time
 
 import cv2
 import numpy as np
-
 
 ROBOT_MARKER_ID = 67
 ROBOT_MEMORY_SECONDS = 1.2
@@ -55,7 +57,6 @@ CORNER_ARENA = [
     (ARENA_W_UNITS, ARENA_H_UNITS),
     (0.0, ARENA_H_UNITS),
 ]
-
 
 # ---------------------------------------------------------------------------
 # Calibration par homographie pixel -> arene 0..255
@@ -103,7 +104,6 @@ class ArenaCalibration:
         pts = np.array(self.pixel_points, dtype=np.float32)
         return abs(float(cv2.contourArea(pts)))
 
-
 class CalibrationState:
     def __init__(self, frame):
         self.display = frame.copy()
@@ -122,7 +122,6 @@ class CalibrationState:
         print(f"  {idx+1}/4 {CORNER_LABELS[idx]} -> pixel ({x}, {y})")
         if len(self.clicks) == 4:
             self.done = True
-
 
 def run_calibration(first_frame):
     calib = ArenaCalibration()
@@ -168,9 +167,8 @@ def run_calibration(first_frame):
     print("")
     return calib
 
-
 # ---------------------------------------------------------------------------
-# Detection ArUco
+# Detection ArUco - OPTIMISEE pour fiabilite
 # ---------------------------------------------------------------------------
 
 def marker_center(corners):
@@ -183,24 +181,38 @@ def marker_angle_deg(corners):
     direction = top_mid - bot_mid
     return math.degrees(math.atan2(-direction[1], direction[0]))
 
+# CLAHE global (cree une seule fois)
+_CLAHE = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
-def detect_aruco_markers(frame, aruco_dict, parameters, robust=False):
+def detect_aruco_markers(frame, detector, detector_upscale):
     """
-    Mode rapide par defaut: une seule detection sur l'image en niveaux de gris.
-    Mode robust (optionnel): essaie aussi une variante CLAHE si rien trouve.
+    Strategie:
+      1) Detection sur gris + CLAHE leger (rapide, robuste aux reflets)
+      2) Si robot non trouve -> retry sur image x2 (gere petits marqueurs)
     """
-    detector = cv2.aruco.ArucoDetector(aruco_dict, parameters)
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    gray = _CLAHE.apply(gray)
 
     corners, ids, _ = detector.detectMarkers(gray)
 
-    # Fallback unique si robust et rien detecte
-    if robust and (ids is None or ROBOT_MARKER_ID not in ids.flatten()):
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        contrast = clahe.apply(gray)
-        c2, i2, _ = detector.detectMarkers(contrast)
-        if i2 is not None and (ids is None or ROBOT_MARKER_ID in i2.flatten()):
-            corners, ids = c2, i2
+    # Si le robot n'est pas dans les detections, on tente l'upscale
+    found_robot = ids is not None and ROBOT_MARKER_ID in ids.flatten()
+    if not found_robot:
+        gray_big = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_LINEAR)
+        c2, i2, _ = detector_upscale.detectMarkers(gray_big)
+        if i2 is not None and ROBOT_MARKER_ID in i2.flatten():
+            # Ramener les coords a l'echelle d'origine
+            c2_scaled = [c / 2.0 for c in c2]
+            if ids is None:
+                corners, ids = c2_scaled, i2
+            else:
+                # Fusionner: ajouter le robot detecte en upscale
+                ids_flat = ids.flatten().tolist()
+                for ci, mid in zip(c2_scaled, i2.flatten()):
+                    if int(mid) not in ids_flat:
+                        corners = list(corners) + [ci]
+                        ids_flat.append(int(mid))
+                ids = np.array(ids_flat, dtype=ids.dtype).reshape(-1, 1)
 
     markers = []
     if ids is not None:
@@ -213,7 +225,6 @@ def detect_aruco_markers(frame, aruco_dict, parameters, robust=False):
                 "corners":   mc.reshape(4, 2).astype(float).tolist(),
             })
     return markers, corners if ids is not None else [], ids
-
 
 # ---------------------------------------------------------------------------
 # Detection QR
@@ -256,7 +267,6 @@ def detect_qr_codes(frame, qr_detector):
         })
     return qrcodes
 
-
 # ---------------------------------------------------------------------------
 # Detection balle rouge / bleue
 # ---------------------------------------------------------------------------
@@ -298,7 +308,6 @@ def detect_ball(frame, min_area):
 
     return best, best_mask
 
-
 # ---------------------------------------------------------------------------
 # Construction etat complet
 # ---------------------------------------------------------------------------
@@ -332,8 +341,8 @@ def point_to_arena(point, frame_shape, calib):
             return pos
     return px_to_arena_simple(point, frame_shape)
 
-def build_state(frame, aruco_dict, parameters, qr_detector, calib,
-                object_memory, enable_qr=False, robust_aruco=False):
+def build_state(frame, detector, detector_upscale, qr_detector, calib,
+                object_memory, enable_qr=False):
     state = {
         "ts": time.time(),
         "unit": ARENA_UNIT_NAME,
@@ -344,7 +353,7 @@ def build_state(frame, aruco_dict, parameters, qr_detector, calib,
         "qrcodes": [],
     }
 
-    markers, corners, ids = detect_aruco_markers(frame, aruco_dict, parameters, robust_aruco)
+    markers, corners, ids = detect_aruco_markers(frame, detector, detector_upscale)
     qrcodes               = detect_qr_codes(frame, qr_detector) if enable_qr else []
 
     for m in markers:
@@ -382,14 +391,16 @@ def build_state(frame, aruco_dict, parameters, qr_detector, calib,
 
     return state, corners, ids, qrcodes
 
-
 # ---------------------------------------------------------------------------
 # Annotations
 # ---------------------------------------------------------------------------
 
 def annotate_frame(frame, state, ball, calib, corners, ids, qrcodes):
     if ids is not None and len(corners) > 0:
-        cv2.aruco.drawDetectedMarkers(frame, corners, ids)
+        try:
+            cv2.aruco.drawDetectedMarkers(frame, corners, ids)
+        except Exception:
+            pass
 
     # Robot
     if state.get("robot"):
@@ -402,7 +413,6 @@ def annotate_frame(frame, state, ball, calib, corners, ids, qrcodes):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, col, 2)
         cv2.putText(frame, f"id={ROBOT_MARKER_ID}", (cx + 8, cy + 14),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1)
-        # Fleche d'orientation
         ang = math.radians(r["angle_deg"])
         ex = int(cx + 40 * math.cos(ang))
         ey = int(cy - 40 * math.sin(ang))
@@ -433,7 +443,6 @@ def annotate_frame(frame, state, ball, calib, corners, ids, qrcodes):
             cv2.circle(frame, (int(pt[0]), int(pt[1])), 6, col, -1)
             cv2.putText(frame, CORNER_LABELS[i], (int(pt[0]) + 8, int(pt[1]) - 6),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.38, col, 1)
-
 
 # ---------------------------------------------------------------------------
 # Camera / UDP
@@ -475,15 +484,9 @@ def open_camera(cam_source, width, height):
     cam.set(cv2.CAP_PROP_FPS, 30)
     return cam
 
-
 class UdpFrameReceiver:
-    """
-    Receveur UDP avec drain: vide le buffer socket a chaque appel a read()
-    pour toujours retourner la frame la plus recente disponible.
-    """
     def __init__(self, ip, port, max_packet_size):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        # Buffer reception OS plus grand pour absorber les rafales
         try:
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
         except OSError:
@@ -492,7 +495,6 @@ class UdpFrameReceiver:
         self.max_packet_size  = max_packet_size
         self.data_buffer      = {}
         self.current_frame_id = -1
-        self.last_completed_frame = None
 
     def _handle_packet(self, packet):
         if len(packet) < UDP_HEADER_SIZE:
@@ -501,7 +503,6 @@ class UdpFrameReceiver:
         payload = packet[UDP_HEADER_SIZE:]
         completed = None
         if frame_id != self.current_frame_id:
-            # Nouvelle frame -> tenter de decoder la precedente
             completed = self._decode()
             self.data_buffer = {}
             self.current_frame_id = frame_id
@@ -509,11 +510,6 @@ class UdpFrameReceiver:
         return completed
 
     def read(self):
-        """
-        Bloque jusqu'a avoir au moins une frame, puis draine tout ce qui
-        est deja dans le socket et ne renvoie que la plus recente.
-        """
-        # 1) Lecture bloquante jusqu'a la prochaine frame complete
         self.sock.setblocking(True)
         latest = None
         while latest is None:
@@ -522,8 +518,6 @@ class UdpFrameReceiver:
             if done is not None:
                 latest = done
 
-        # 2) Drain non-bloquant: si d'autres frames sont deja arrivees,
-        #    on les remplace par la plus recente.
         self.sock.setblocking(False)
         try:
             while True:
@@ -531,31 +525,68 @@ class UdpFrameReceiver:
                 done = self._handle_packet(packet)
                 if done is not None:
                     latest = done
-        except BlockingIOError:
-            pass
-        except OSError:
+        except (BlockingIOError, OSError):
             pass
         self.sock.setblocking(True)
-
         return latest
 
     def _decode(self):
-        if self.current_frame_id == -1:
-            return None
-        if not self.data_buffer:
+        if self.current_frame_id == -1 or not self.data_buffer:
             return None
         try:
             full_data   = b"".join(self.data_buffer[i] for i in sorted(self.data_buffer))
             frame_data  = full_data[UDP_MESSAGE_HEADER_SIZE:]
             frame_buf   = np.frombuffer(frame_data, dtype=np.uint8)
-            img = cv2.imdecode(frame_buf, 1)
-            return img
+            return cv2.imdecode(frame_buf, 1)
         except Exception:
             return None
 
     def close(self):
         self.sock.close()
 
+# ---------------------------------------------------------------------------
+# Construction des detecteurs ArUco
+# ---------------------------------------------------------------------------
+
+def build_aruco_detectors():
+    """
+    Cree 2 detecteurs:
+      - detector: rapide, pour image normale (parametres equilibres)
+      - detector_upscale: utilise sur image x2 quand robot pas trouve
+        (parametres plus permissifs pour petits marqueurs)
+    """
+    aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_100)
+
+    # --- Detecteur principal (rapide + permissif raisonnable) ---
+    p1 = cv2.aruco.DetectorParameters()
+    p1.adaptiveThreshWinSizeMin    = 3
+    p1.adaptiveThreshWinSizeMax    = 23
+    p1.adaptiveThreshWinSizeStep   = 10
+    p1.minMarkerPerimeterRate      = 0.02   # accepte petits marqueurs
+    p1.maxMarkerPerimeterRate      = 4.0
+    p1.polygonalApproxAccuracyRate = 0.05
+    p1.minCornerDistanceRate       = 0.05
+    p1.minDistanceToBorder         = 3
+    p1.cornerRefinementMethod      = cv2.aruco.CORNER_REFINE_NONE
+    p1.errorCorrectionRate         = 0.8    # tolerant aux erreurs de bits
+
+    # --- Detecteur upscale (encore plus permissif) ---
+    p2 = cv2.aruco.DetectorParameters()
+    p2.adaptiveThreshWinSizeMin    = 3
+    p2.adaptiveThreshWinSizeMax    = 35
+    p2.adaptiveThreshWinSizeStep   = 8
+    p2.minMarkerPerimeterRate      = 0.01
+    p2.maxMarkerPerimeterRate      = 4.0
+    p2.polygonalApproxAccuracyRate = 0.08
+    p2.minCornerDistanceRate       = 0.03
+    p2.minDistanceToBorder         = 2
+    p2.cornerRefinementMethod      = cv2.aruco.CORNER_REFINE_SUBPIX
+    p2.cornerRefinementWinSize     = 5
+    p2.errorCorrectionRate         = 1.0
+
+    detector  = cv2.aruco.ArucoDetector(aruco_dict, p1)
+    detector2 = cv2.aruco.ArucoDetector(aruco_dict, p2)
+    return detector, detector2
 
 # ---------------------------------------------------------------------------
 # Main
@@ -565,10 +596,8 @@ def main():
     parser = argparse.ArgumentParser(description="Vision robot ArUco ID67 + balle rouge/bleue")
     parser.add_argument("--robot-ip",       default="255.255.255.255")
     parser.add_argument("--port",           type=int,   default=8081)
-    parser.add_argument("--cam0",           default="1",
-                        help="Index camera OpenCV ou URL RTSP/HTTP de camera reseau")
-    parser.add_argument("--cam1",           default="2",
-                        help="Index camera OpenCV ou URL RTSP/HTTP de camera reseau")
+    parser.add_argument("--cam0",           default="1")
+    parser.add_argument("--cam1",           default="2")
     parser.add_argument("--single-camera",  action="store_true")
     parser.add_argument("--udp-video",      action="store_true")
     parser.add_argument("--udp-ip",         default="")
@@ -577,19 +606,15 @@ def main():
     parser.add_argument("--stack",          choices=("vertical","horizontal"), default="vertical")
     parser.add_argument("--width",          type=int,   default=1280)
     parser.add_argument("--height",         type=int,   default=720)
-    parser.add_argument("--scale-send",     type=int,   default=2)
+    parser.add_argument("--scale-send",     type=int,   default=1,
+                        help="1 = pas de reduction (meilleure detection). 2 = divise par 2.")
     parser.add_argument("--ball-min-area",  type=float, default=20.0)
     parser.add_argument("--show-mask",      action="store_true")
     parser.add_argument("--enable-qr",      action="store_true")
-    parser.add_argument("--robust-aruco",   action="store_true",
-                        help="Active un essai supplementaire CLAHE si rien detecte (legerement plus lent)")
-    parser.add_argument("--no-display",     action="store_true",
-                        help="Desactive l'affichage OpenCV (gain de perf significatif)")
-    parser.add_argument("--no-calib",       action="store_true",
-                        help="Demarre sans calibration (GPS estime par largeur/hauteur image)")
+    parser.add_argument("--no-display",     action="store_true")
+    parser.add_argument("--no-calib",       action="store_true")
     args = parser.parse_args()
 
-    # Source video
     frame_receiver = None
     camera0 = camera1 = None
     if args.udp_video:
@@ -597,25 +622,13 @@ def main():
         print(f"Reception video UDP sur {args.udp_ip or '0.0.0.0'}:{args.udp_port}...")
     else:
         camera0 = open_camera(parse_camera_source(args.cam0), args.width, args.height)
-        camera1 = None if args.single_camera else open_camera(parse_camera_source(args.cam1), args.width, args.height)
+        camera1 = None if args.single_camera else open_camera(
+            parse_camera_source(args.cam1), args.width, args.height)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
-    # ---- Parametres ArUco RAPIDES ----
-    aruco_dict  = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_100)
-    parameters = cv2.aruco.DetectorParameters()
-    parameters.adaptiveThreshWinSizeMin   = 3
-    parameters.adaptiveThreshWinSizeMax   = 23      # etait 101 (tres lent)
-    parameters.adaptiveThreshWinSizeStep  = 10      # etait 4 (faisait 25 passes)
-    parameters.minMarkerPerimeterRate     = 0.03
-    parameters.maxMarkerPerimeterRate     = 4.0
-    parameters.polygonalApproxAccuracyRate = 0.05
-    parameters.minCornerDistanceRate      = 0.05
-    parameters.minDistanceToBorder        = 3
-    parameters.cornerRefinementMethod     = cv2.aruco.CORNER_REFINE_NONE  # etait SUBPIX (lent)
-    parameters.errorCorrectionRate        = 0.6
-
+    detector, detector_upscale = build_aruco_detectors()
     qr_detector = cv2.QRCodeDetector()
     object_memory = {}
 
@@ -638,7 +651,6 @@ def main():
                 (frame.shape[1] // args.scale_send, frame.shape[0] // args.scale_send))
         return frame
 
-    # Calibration
     calib = None
     if not args.no_calib:
         print("Attente de la premiere frame...")
@@ -649,12 +661,10 @@ def main():
         if calib is None:
             print("Calibration annulee, GPS estime par largeur/hauteur image.")
 
-    # Stats FPS
     fps_t0 = time.time()
     fps_n  = 0
     fps_val = 0.0
 
-    # Boucle principale
     while True:
         frame = get_frame()
         if frame is None:
@@ -662,14 +672,8 @@ def main():
         frame = scale(frame)
 
         state, corners, ids, qrcodes = build_state(
-            frame,
-            aruco_dict,
-            parameters,
-            qr_detector,
-            calib,
-            object_memory,
-            args.enable_qr,
-            args.robust_aruco
+            frame, detector, detector_upscale, qr_detector,
+            calib, object_memory, args.enable_qr
         )
         ball, ball_mask = detect_ball(frame, args.ball_min_area)
 
@@ -693,13 +697,11 @@ def main():
                 state["ball"]["stale"] = True
                 state["ball"]["age"] = age
 
-        # Envoi UDP avant l'affichage (latence min sur le robot)
         try:
             sock.sendto(json.dumps(state).encode("utf-8"), (args.robot_ip, args.port))
         except OSError:
             pass
 
-        # FPS
         fps_n += 1
         now = time.time()
         if now - fps_t0 >= 1.0:
@@ -716,17 +718,12 @@ def main():
                 cv2.imshow("ball_mask", ball_mask)
             if cv2.waitKey(1) & 0xFF in (ord('q'), ord('Q')):
                 break
-        else:
-            # Sans affichage on imprime le FPS de temps en temps
-            if fps_n == 0 and fps_val > 0:
-                print(f"FPS={fps_val:.1f}", end="\r")
 
     if frame_receiver: frame_receiver.close()
     if camera0:        camera0.release()
     if camera1:        camera1.release()
     sock.close()
     cv2.destroyAllWindows()
-
 
 if __name__ == "__main__":
     main()
