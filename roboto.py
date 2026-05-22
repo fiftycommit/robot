@@ -64,23 +64,38 @@ SPEED_STEP = 5
 SPEED_MIN = 10
 SPEED_MAX = 100
 
+ROBOT_ARUCO_ID = 67
 CAMERA_STATE_PORT = 8081
-CAMERA_STATE_MAX_AGE = 0.6
-CAMERA_ANGLE_OK = 10
+CAMERA_STATE_MAX_AGE = 0.35
+CAMERA_SOCKET_TIMEOUT = 0.05
+CAMERA_ANGLE_OK = 8
 CAMERA_CONTACT_DIST = 23.0
 CAMERA_APPROACH_DIST = 80.0
 CAMERA_SLOW_SPEED = 22
-CAMERA_TURN_SPEED = 22
+CAMERA_TURN_SPEED = 18
 CAMERA_VERBOSE_INTERVAL = 0.25
+CAMERA_HEADING_GAIN = 0.45
+CAMERA_MAX_CORRECTION = 16
+CAMERA_MAX_ARC_DIFF = 35
+AUTO_REQUIRE_CAMERA = True
+AUTO_FOLLOW_BALL = False
+AUTO_LOOP_DELAY = 0.02
+AUTO_US_SAMPLES = 1
+AUTO_US_DELAY = 0.0
+AUTO_VERBOSE_POSITION_EVERY_LOOP = True
 
-AUTO_VERBOSE = True
+AUTO_VERBOSE_ALWAYS = True
 
-ARENA_W_CM = 301.0
-ARENA_H_CM = 390.0
-ARENA_MARGIN_CM = 35.0
-ARENA_CRITICAL_MARGIN_CM = 18.0
-ARENA_CENTER_X = ARENA_W_CM / 2.0
-ARENA_CENTER_Y = ARENA_H_CM / 2.0
+# Repere venant de vision_server.py:
+# Bas-Gauche=(0,0), Bas-Droit=(255,0), Haut-Droit=(255,255), Haut-Gauche=(0,255).
+# Les distances ARENA_* sont des unites normalisees, pas des centimetres.
+ARENA_W_UNITS = 255.0
+ARENA_H_UNITS = 255.0
+ARENA_MARGIN_UNITS = 32.0
+ARENA_CLEAR_MARGIN_UNITS = 45.0
+ARENA_CRITICAL_MARGIN_UNITS = 16.0
+ARENA_CENTER_X = ARENA_W_UNITS / 2.0
+ARENA_CENTER_Y = ARENA_H_UNITS / 2.0
 ARENA_ESCAPE_SPEED = 20
 
 
@@ -99,6 +114,9 @@ camera_lock = threading.Lock()
 camera_last_shot = 0
 camera_escape_dir = 1
 last_camera_verbose = 0
+last_camera_missing_log = 0
+camera_target_heading = None
+arena_recovering = False
 
 
 def drive(left, right):
@@ -205,21 +223,77 @@ def angle_diff(target, current):
     return (target - current + 180) % 360 - 180
 
 
+def clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+def arena_coord(obj, axis):
+    for key in (axis, axis + "_arena", axis + "_gps", axis + "_cm"):
+        if key in obj and obj[key] is not None:
+            return float(obj[key])
+    raise KeyError("coordonnees arena manquantes: {}".format(axis))
+
+
+def robot_pose(robot):
+    return (
+        arena_coord(robot, "x"),
+        arena_coord(robot, "y"),
+        float(robot.get("angle_deg", 0.0)),
+    )
+
+
 def arena_edges(robot):
-    x = robot["x_cm"]
-    y = robot["y_cm"]
+    x, y, _ = robot_pose(robot)
     return {
         "G": x,
-        "D": ARENA_W_CM - x,
-        "H": y,
-        "B": ARENA_H_CM - y,
+        "D": ARENA_W_UNITS - x,
+        "B": y,
+        "H": ARENA_H_UNITS - y,
     }
 
 
-def log_camera_verbose(robot, ball, ball_dist, diff):
+def enrich_camera_state(state, rx_ts):
+    state["_rx_ts"] = rx_ts
+    state.setdefault("expected_robot_id", ROBOT_ARUCO_ID)
+    state.setdefault("arena", {"w": ARENA_W_UNITS, "h": ARENA_H_UNITS})
+
+    robot = state.get("robot")
+    if robot:
+        robot["_rx_ts"] = rx_ts
+        robot["edges"] = arena_edges(robot)
+        robot["closest_edge"] = min(robot["edges"].values())
+
+    return state
+
+
+def drive_turn_towards(diff, speed=CAMERA_TURN_SPEED):
+    if diff > 0:
+        drive(-speed, speed)
+    else:
+        drive(speed, -speed)
+
+
+def drive_with_heading(robot_angle, target_angle, speed):
+    diff = angle_diff(target_angle, robot_angle)
+
+    if abs(diff) > CAMERA_MAX_ARC_DIFF:
+        drive_turn_towards(diff, CAMERA_TURN_SPEED)
+        return diff, "tourner_cap"
+
+    correction = clamp(diff * CAMERA_HEADING_GAIN, -CAMERA_MAX_CORRECTION, CAMERA_MAX_CORRECTION)
+    left = int(clamp(speed - correction, -SPEED_MAX, SPEED_MAX))
+    right = int(clamp(speed + correction, -SPEED_MAX, SPEED_MAX))
+    drive(left, right)
+    if abs(diff) <= CAMERA_ANGLE_OK:
+        return diff, "avancer_droit"
+    return diff, "corriger_cap"
+
+
+def log_camera_verbose(robot, decision, target_angle=None, diff=None,
+                       ball=None, ball_dist=None, obstacle_dist=None):
     global last_camera_verbose
 
-    if not AUTO_VERBOSE:
+    if not AUTO_VERBOSE_ALWAYS:
         return
 
     now = time.time()
@@ -227,21 +301,39 @@ def log_camera_verbose(robot, ball, ball_dist, diff):
         return
 
     edges = arena_edges(robot)
-    print(
-        "\r\n[CAMERA] robot=({:.1f},{:.1f}) angle={:.1f} "
-        "balle=({:.1f},{:.1f}) dist={:.1f} diff={:.1f} "
-        "bords G={:.1f} D={:.1f} H={:.1f} B={:.1f}".format(
-            robot["x_cm"],
-            robot["y_cm"],
-            robot.get("angle_deg", 0.0),
-            ball["x_cm"],
-            ball["y_cm"],
+    x, y, robot_angle = robot_pose(robot)
+    ball_text = ""
+    if ball is not None and ball_dist is not None:
+        ball_text = " balle=({:.1f},{:.1f}) dist={:.1f}".format(
+            arena_coord(ball, "x"),
+            arena_coord(ball, "y"),
             ball_dist,
-            diff,
+        )
+    target_text = ""
+    if target_angle is not None and diff is not None:
+        target_text = " cible={:.1f} diff={:.1f}".format(target_angle, diff)
+    obstacle_text = ""
+    if obstacle_dist is not None:
+        obstacle_text = " us={:.1f}cm".format(obstacle_dist)
+    age_text = ""
+    if "_rx_ts" in robot:
+        age_text = " age={:.2f}s".format(now - robot["_rx_ts"])
+
+    print(
+        "\r\n[CAMERA] decision={} robot=({:.1f},{:.1f}) angle={:.1f}{}{}{}{} "
+        "bords G={:.1f} D={:.1f} B={:.1f} H={:.1f}".format(
+            decision,
+            x,
+            y,
+            robot_angle,
+            target_text,
+            ball_text,
+            obstacle_text,
+            age_text,
             edges["G"],
             edges["D"],
-            edges["H"],
             edges["B"],
+            edges["H"],
         ),
         end=''
     )
@@ -249,44 +341,77 @@ def log_camera_verbose(robot, ball, ball_dist, diff):
     last_camera_verbose = now
 
 
-def keep_inside_arena(robot):
+def log_robot_position_verbose(state, obstacle_dist=None):
+    if not AUTO_VERBOSE_ALWAYS or not AUTO_VERBOSE_POSITION_EVERY_LOOP:
+        return
+
+    robot = state["robot"]
     edges = arena_edges(robot)
-    closest = min(edges.values())
+    x, y, robot_angle = robot_pose(robot)
+    age = state.get("camera_age", time.time() - state.get("_rx_ts", time.time()))
+    closest_name = min(edges, key=edges.get)
+    obstacle_text = ""
+    if obstacle_dist is not None:
+        obstacle_text = " us={:.1f}cm".format(obstacle_dist)
 
-    if closest > ARENA_MARGIN_CM:
-        return False
-
-    target_angle = math.degrees(math.atan2(
-        ARENA_CENTER_Y - robot["y_cm"],
-        ARENA_CENTER_X - robot["x_cm"]
-    ))
-    robot_angle = robot.get("angle_deg", 0.0)
-    diff = angle_diff(target_angle, robot_angle)
-
-    level = "CRITIQUE" if closest <= ARENA_CRITICAL_MARGIN_CM else "MARGE"
     print(
-        "\r\n[LIMITE] {} robot=({:.1f},{:.1f}) angle={:.1f} "
-        "bords G={:.1f} D={:.1f} H={:.1f} B={:.1f} -> centre diff={:.1f}".format(
-            level,
-            robot["x_cm"],
-            robot["y_cm"],
+        "\r\n[POS_ROBOT] source=aruco{} age={:.2f}s pos=({:.1f},{:.1f}) angle={:.1f}{} "
+        "bords G={:.1f} D={:.1f} B={:.1f} H={:.1f} proche={}:{:.1f} stale={}".format(
+            ROBOT_ARUCO_ID,
+            age,
+            x,
+            y,
             robot_angle,
+            obstacle_text,
             edges["G"],
             edges["D"],
-            edges["H"],
             edges["B"],
-            diff,
+            edges["H"],
+            closest_name,
+            edges[closest_name],
+            bool(robot.get("stale")),
         ),
         end=''
     )
 
-    if abs(diff) > CAMERA_ANGLE_OK:
-        if diff > 0:
-            drive(CAMERA_TURN_SPEED, -CAMERA_TURN_SPEED)
-        else:
-            drive(-CAMERA_TURN_SPEED, CAMERA_TURN_SPEED)
+
+def keep_inside_arena(robot):
+    global camera_target_heading, arena_recovering
+
+    edges = arena_edges(robot)
+    closest = min(edges.values())
+    x, y, robot_angle = robot_pose(robot)
+
+    if closest > ARENA_CLEAR_MARGIN_UNITS:
+        if arena_recovering:
+            camera_target_heading = robot_angle
+            arena_recovering = False
+            log_camera_verbose(robot, "sortie_zone_bord", camera_target_heading, 0.0)
+        return False
+
+    if closest > ARENA_MARGIN_UNITS and not arena_recovering:
+        return False
+
+    arena_recovering = True
+    target_angle = math.degrees(math.atan2(
+        ARENA_CENTER_Y - y,
+        ARENA_CENTER_X - x
+    ))
+    camera_target_heading = target_angle
+    diff = angle_diff(target_angle, robot_angle)
+
+    if closest <= ARENA_CRITICAL_MARGIN_UNITS and abs(diff) > CAMERA_ANGLE_OK:
+        stop()
+        time.sleep(0.08)
+        drive_turn_towards(diff, CAMERA_TURN_SPEED)
+        decision = "retour_centre_critique"
+    elif abs(diff) > CAMERA_MAX_ARC_DIFF:
+        drive_turn_towards(diff, CAMERA_TURN_SPEED)
+        decision = "tour_progressif_centre"
     else:
-        drive(ARENA_ESCAPE_SPEED, ARENA_ESCAPE_SPEED)
+        diff, decision = drive_with_heading(robot_angle, target_angle, ARENA_ESCAPE_SPEED)
+
+    log_camera_verbose(robot, decision, target_angle, diff)
 
     return True
 
@@ -297,15 +422,16 @@ def camera_state_thread():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("", CAMERA_STATE_PORT))
-    sock.settimeout(0.2)
+    sock.settimeout(CAMERA_SOCKET_TIMEOUT)
 
-    print("\r\n[CAMERA] attente UDP port {}".format(CAMERA_STATE_PORT))
+    print("\r\n[CAMERA] attente UDP port {} robot ArUco ID {}".format(
+        CAMERA_STATE_PORT, ROBOT_ARUCO_ID))
 
     while running:
         try:
             data, _ = sock.recvfrom(4096)
             state = json.loads(data.decode("utf-8"))
-            state["_rx_ts"] = time.time()
+            state = enrich_camera_state(state, time.time())
             with camera_lock:
                 latest_camera_state = state
         except socket.timeout:
@@ -322,57 +448,76 @@ def get_fresh_camera_state():
 
     if not state:
         return None
-    if time.time() - state.get("_rx_ts", 0) > CAMERA_STATE_MAX_AGE:
+    age = time.time() - state.get("_rx_ts", 0)
+    if age > CAMERA_STATE_MAX_AGE:
         return None
-    if not state.get("robot") or not state.get("ball"):
+    if not state.get("robot"):
         return None
+    state["camera_age"] = age
     return state
 
 
 def camera_auto_step(state, d, now):
-    global camera_last_shot, camera_escape_dir
+    global camera_last_shot, camera_escape_dir, camera_target_heading
 
     robot = state["robot"]
-    ball = state["ball"]
 
-    dx = ball["x_cm"] - robot["x_cm"]
-    dy = ball["y_cm"] - robot["y_cm"]
-    ball_dist = math.hypot(dx, dy)
-    target_angle = math.degrees(math.atan2(dy, dx))
-    diff = angle_diff(target_angle, robot.get("angle_deg", 0.0))
+    if robot.get("stale"):
+        stop()
+        log_camera_verbose(robot, "stop_camera_stale", obstacle_dist=d)
+        return True
 
-    log_camera_verbose(robot, ball, ball_dist, diff)
+    if not robot.get("angle_available", True):
+        stop()
+        log_camera_verbose(robot, "stop_angle_indisponible", obstacle_dist=d)
+        return True
+
+    x, y, robot_angle = robot_pose(robot)
 
     if keep_inside_arena(robot):
         return True
 
-    if d <= OBSTACLE_DIST and ball_dist > CAMERA_APPROACH_DIST:
+    ball = state.get("ball")
+    ball_dist = None
+
+    if d <= OBSTACLE_DIST:
         stop()
-        print("\r\n[CAMERA] obstacle ultrason devant, balle ailleurs - securite")
-        return False
-
-    if ball_dist <= CAMERA_CONTACT_DIST and now - camera_last_shot >= SHOT_COOLDOWN:
-        stop()
-        print("\r\n[CAMERA] balle au contact ({:.1f}cm) - TIR".format(ball_dist))
-        scoop()
-        time.sleep(POST_SHOT_CHECK_TIME)
-        after_shot_d = read_distance()
-        camera_last_shot = time.time()
-
-        if after_shot_d <= DETECT_DIST:
-            print("\r\n[CAMERA] objet encore devant apres tir ({:.1f}cm) - RECUL + SCAN".format(after_shot_d))
-            camera_escape_dir, _ = recover_from_obstacle(1, camera_escape_dir)
-
+        log_camera_verbose(robot, "obstacle_ultrason_stop", obstacle_dist=d)
         return True
 
-    if abs(diff) > CAMERA_ANGLE_OK:
-        if diff > 0:
-            drive(CAMERA_TURN_SPEED, -CAMERA_TURN_SPEED)
-        else:
-            drive(-CAMERA_TURN_SPEED, CAMERA_TURN_SPEED)
-    else:
-        speed = CAMERA_SLOW_SPEED if ball_dist <= DETECT_DIST else DRIVE_SPEED
-        drive(speed, speed)
+    if camera_target_heading is None:
+        camera_target_heading = robot_angle
+
+    if AUTO_FOLLOW_BALL and ball and not ball.get("stale"):
+        dx = arena_coord(ball, "x") - x
+        dy = arena_coord(ball, "y") - y
+        ball_dist = math.hypot(dx, dy)
+        target_angle = math.degrees(math.atan2(dy, dx))
+        diff = angle_diff(target_angle, robot_angle)
+
+        if ball_dist <= CAMERA_CONTACT_DIST and now - camera_last_shot >= SHOT_COOLDOWN:
+            stop()
+            print("\r\n[CAMERA] balle au contact ({:.1f} arena) - TIR".format(ball_dist))
+            scoop()
+            time.sleep(POST_SHOT_CHECK_TIME)
+            after_shot_d = read_distance()
+            camera_last_shot = time.time()
+
+            if after_shot_d <= DETECT_DIST:
+                print("\r\n[CAMERA] objet encore devant apres tir ({:.1f}cm) - RECUL + SCAN".format(after_shot_d))
+                camera_escape_dir, _ = recover_from_obstacle(1, camera_escape_dir)
+
+            return True
+
+        speed = CAMERA_SLOW_SPEED if ball_dist <= CAMERA_APPROACH_DIST else DRIVE_SPEED
+        diff, decision = drive_with_heading(robot_angle, target_angle, speed)
+        log_camera_verbose(robot, decision + "_balle", target_angle, diff,
+                           ball=ball, ball_dist=ball_dist, obstacle_dist=d)
+        return True
+
+    speed = auto_speed_for_distance(d)
+    diff, decision = drive_with_heading(robot_angle, camera_target_heading, speed)
+    log_camera_verbose(robot, decision, camera_target_heading, diff, obstacle_dist=d)
 
     return True
 
@@ -381,7 +526,8 @@ KEY_TIMEOUT = 0.15
 
 
 def read_keys():
-    global running, auto_mode, DRIVE_SPEED
+    global running, auto_mode, DRIVE_SPEED, AUTO_FOLLOW_BALL
+    global camera_target_heading, arena_recovering
 
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
@@ -469,13 +615,22 @@ def read_keys():
             elif ch == 'a':
                 auto_mode = not auto_mode
                 if auto_mode:
+                    camera_target_heading = None
+                    arena_recovering = False
                     print("\r-> Mode AUTO ON       ", end='')
                 else:
+                    arena_recovering = False
+                    stop()
                     print("\r-> Mode AUTO OFF      ", end='')
+            elif ch == 'b':
+                AUTO_FOLLOW_BALL = not AUTO_FOLLOW_BALL
+                print("\r-> Suivi balle {}       ".format("ON" if AUTO_FOLLOW_BALL else "OFF"), end='')
             elif ch == 'x':
                 for k in keys:
                     keys[k] = False
                 auto_mode = False
+                arena_recovering = False
+                stop()
             elif ch == 'p':
                 DRIVE_SPEED = min(SPEED_MAX, DRIVE_SPEED + SPEED_STEP)
                 print("\r-> DRIVE_SPEED = {}       ".format(DRIVE_SPEED), end='')
@@ -549,7 +704,7 @@ def recover_from_obstacle(stuck_count, escape_dir):
 
 
 def auto_thread():
-    global auto_mode
+    global auto_mode, last_camera_missing_log
 
     last_log = 0
     close_count = 0
@@ -566,8 +721,19 @@ def auto_thread():
 
     while running:
         if auto_mode:
-            raw_d = read_distance()
             now = time.time()
+
+            camera_state = get_fresh_camera_state()
+            if not camera_state:
+                stop()
+                if now - last_camera_missing_log >= 0.5:
+                    print("\r\n[CAMERA] stop_camera_perdue: aucun robot ArUco ID {} frais recu".format(
+                        ROBOT_ARUCO_ID))
+                    last_camera_missing_log = now
+                time.sleep(AUTO_LOOP_DELAY)
+                continue
+
+            raw_d = read_distance(samples=AUTO_US_SAMPLES, delay=AUTO_US_DELAY)
 
             lost_echo = raw_d >= 999
             if lost_echo:
@@ -579,9 +745,17 @@ def auto_thread():
                 d = raw_d
                 last_valid_d = raw_d
 
-            camera_state = get_fresh_camera_state()
+            log_robot_position_verbose(camera_state, d)
+
             if camera_state and camera_auto_step(camera_state, d, now):
-                time.sleep(0.05)
+                time.sleep(AUTO_LOOP_DELAY)
+                continue
+            if AUTO_REQUIRE_CAMERA:
+                stop()
+                if now - last_camera_missing_log >= 0.5:
+                    print("\r\n[CAMERA] stop_camera_perdue: aucun robot frais recu")
+                    last_camera_missing_log = now
+                time.sleep(AUTO_LOOP_DELAY)
                 continue
 
             if now - last_log >= 0.2:
@@ -706,7 +880,7 @@ def auto_thread():
             else:
                 stuck_start = 0
 
-        time.sleep(0.05)
+        time.sleep(AUTO_LOOP_DELAY)
 
 
 def motor_thread():
@@ -758,6 +932,8 @@ def main():
     print("3         : Monter pelle en position haute")
     print("0 / 9     : Zero pelle / afficher position")
     print("A         : Mode auto")
+    print("Verbose   : Position ArUco + bords affiches en continu en auto")
+    print("B         : Suivi balle optionnel ON/OFF")
     print("X         : Stop")
     print("P / M     : Ajuster DRIVE_SPEED (+/- {})".format(SPEED_STEP))
     print("U         : Enregistrer distance calibration")

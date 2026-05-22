@@ -30,6 +30,7 @@ BALL_MEMORY_SECONDS = 0.8
 
 ARENA_W_UNITS = 255.0
 ARENA_H_UNITS = 255.0
+ARENA_UNIT_NAME = "arena_0_255"
 
 RED_LOWER_1 = np.array([0, 90, 70])
 RED_UPPER_1 = np.array([12, 255, 255])
@@ -90,6 +91,24 @@ class ArenaCalibration:
         y = float(result[0][0][1])
         return arena_position(x, y)
 
+    def calibration_errors(self):
+        if self.homography is None:
+            return []
+        errors = []
+        for px, expected in zip(self.pixel_points, CORNER_ARENA):
+            mapped = self.pixel_to_arena(px)
+            if mapped is None:
+                continue
+            err = math.hypot(mapped["x"] - expected[0], mapped["y"] - expected[1])
+            errors.append((px, expected, mapped, err))
+        return errors
+
+    def clicked_area_px(self):
+        if len(self.pixel_points) != 4:
+            return 0.0
+        pts = np.array(self.pixel_points, dtype=np.float32)
+        return abs(float(cv2.contourArea(pts)))
+
 
 class CalibrationState:
     def __init__(self, frame):
@@ -141,7 +160,23 @@ def run_calibration(first_frame):
     for px in state.clicks:
         calib.add_point(px)
 
-    print(f"Calibration OK  repere arene 0..{ARENA_W_UNITS:.0f} x 0..{ARENA_H_UNITS:.0f}\n")
+    print(f"Calibration OK  repere arene 0..{ARENA_W_UNITS:.0f} x 0..{ARENA_H_UNITS:.0f}")
+    area = calib.clicked_area_px()
+    print("Surface cliquee: {:.0f} px2".format(area))
+    if area < 1000:
+        print("  ATTENTION: surface tres faible, les coins sont probablement mal cliques.")
+    print("Controle homographie pixel -> arene:")
+    max_err = 0.0
+    for i, (_, expected, mapped, err) in enumerate(calib.calibration_errors()):
+        max_err = max(max_err, err)
+        print(
+            "  {}: attendu=({:.1f},{:.1f}) obtenu=({:.1f},{:.1f}) err={:.2f}".format(
+                CORNER_LABELS[i], expected[0], expected[1], mapped["x"], mapped["y"], err
+            )
+        )
+    if max_err > 2.0:
+        print("  ATTENTION: erreur de calibration elevee, verifier l'ordre des clics.")
+    print("")
     return calib
 
 
@@ -296,10 +331,14 @@ def detect_ball(frame, min_area):
 
 def arena_position(x, y):
     # Champs x/y propres + anciens alias pour rester compatible avec les
-    # scripts EV3 existants.
+    # scripts EV3 existants. Ces valeurs ne sont pas des centimetres:
+    # ce sont des unites normalisees dans le repere mathematique de l'arene.
     return {
         "x": x,
         "y": y,
+        "unit": ARENA_UNIT_NAME,
+        "arena_w": ARENA_W_UNITS,
+        "arena_h": ARENA_H_UNITS,
         "x_arena": x,
         "y_arena": y,
         "x_gps": x,
@@ -324,7 +363,15 @@ def point_to_arena(point, frame_shape, calib):
 
 def build_state(frame, aruco_dict, parameters, qr_detector, calib,
                 object_memory, enable_qr=False, robust_aruco=False):
-    state = {"ts": time.time(), "robot": None, "ball": None, "markers": [], "qrcodes": []}
+    state = {
+        "ts": time.time(),
+        "unit": ARENA_UNIT_NAME,
+        "arena": {"w": ARENA_W_UNITS, "h": ARENA_H_UNITS},
+        "robot": None,
+        "ball": None,
+        "markers": [],
+        "qrcodes": [],
+    }
 
     markers, corners, ids = detect_aruco_markers(frame, aruco_dict, parameters, robust_aruco)
     qrcodes               = detect_qr_codes(frame, qr_detector) if enable_qr else []
