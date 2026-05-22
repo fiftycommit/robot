@@ -49,10 +49,6 @@ UDP_MESSAGE_HEADER_SIZE = 4
 
 CORNER_LABELS = ["Bas-Gauche", "Bas-Droit", "Haut-Droit", "Haut-Gauche"]
 CORNER_COLORS = [(0, 255, 0), (0, 200, 255), (0, 0, 255), (255, 0, 255)]
-# Coins arene correspondants (meme ordre).
-# Repere mathematique normalise:
-#   Bas-Gauche=(0,0), Bas-Droit=(255,0),
-#   Haut-Droit=(255,255), Haut-Gauche=(0,255).
 CORNER_ARENA = [
     (0.0, 0.0),
     (ARENA_W_UNITS, 0.0),
@@ -62,9 +58,7 @@ CORNER_ARENA = [
 
 
 # ---------------------------------------------------------------------------
-# Calibration par homographie pixel -> arene 0..255.
-# L'axe Y OpenCV descend dans l'image, mais les destinations d'homographie
-# placent le bas de l'arene a y=0 et le haut a y=255.
+# Calibration par homographie pixel -> arene 0..255
 # ---------------------------------------------------------------------------
 
 class ArenaCalibration:
@@ -134,27 +128,22 @@ def run_calibration(first_frame):
     calib = ArenaCalibration()
     state = CalibrationState(first_frame)
 
+    print("")
+    print("=== CALIBRATION ARENE ===")
+    print("Cliquez les 4 coins du ruban jaune dans cet ordre :")
+    for i, lab in enumerate(CORNER_LABELS):
+        print(f"  {i+1}. {lab}")
+    print("Appuyez sur Q pour annuler.")
+    print("")
+
     cv2.namedWindow("calibration")
     cv2.setMouseCallback("calibration", state.mouse_callback)
-
-    print("\n=== CALIBRATION ARENE ===")
-    print("Cliquez les 4 coins du ruban jaune dans cet ordre :")
-    for i, label in enumerate(CORNER_LABELS):
-        print(f"  {i+1}. {label}")
-    print("Appuyez sur Q pour annuler.\n")
-
     while not state.done:
-        overlay = state.display.copy()
-        idx = len(state.clicks)
-        if idx < 4:
-            msg = f"Cliquez : {CORNER_LABELS[idx]}  ({idx+1}/4)"
-            cv2.putText(overlay, msg, (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, CORNER_COLORS[idx], 2)
-        cv2.imshow("calibration", overlay)
-        if cv2.waitKey(30) & 0xFF == ord('q'):
+        cv2.imshow("calibration", state.display)
+        key = cv2.waitKey(20) & 0xFF
+        if key in (ord('q'), ord('Q')):
             cv2.destroyWindow("calibration")
             return None
-
     cv2.destroyWindow("calibration")
 
     for px in state.clicks:
@@ -192,50 +181,28 @@ def marker_angle_deg(corners):
     top_mid   = (pts[0] + pts[1]) / 2.0
     bot_mid   = (pts[2] + pts[3]) / 2.0
     direction = top_mid - bot_mid
-    # OpenCV a y vers le bas. On inverse dy pour publier un angle en repere
-    # mathematique: 0 deg vers +X, 90 deg vers +Y.
     return math.degrees(math.atan2(-direction[1], direction[0]))
 
-def aruco_frame_variants(frame):
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    contrast = clahe.apply(gray)
-    blur = cv2.GaussianBlur(contrast, (0, 0), 1.0)
-    sharp = cv2.addWeighted(contrast, 1.6, blur, -0.6, 0)
-    variants = [gray, contrast, sharp]
-    enlarged = [
-        cv2.resize(image, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
-        for image in variants
-    ]
-    return [(image, 1.0) for image in variants] + [(image, 2.0) for image in enlarged]
 
 def detect_aruco_markers(frame, aruco_dict, parameters, robust=False):
-    detector        = cv2.aruco.ArucoDetector(aruco_dict, parameters)
-    best_corners    = []
-    best_ids        = None
+    """
+    Mode rapide par defaut: une seule detection sur l'image en niveaux de gris.
+    Mode robust (optionnel): essaie aussi une variante CLAHE si rien trouve.
+    """
+    detector = cv2.aruco.ArucoDetector(aruco_dict, parameters)
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-    if robust:
-        candidates = aruco_frame_variants(frame)
-    else:
-        candidates = [(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), 1.0)]
+    corners, ids, _ = detector.detectMarkers(gray)
 
-    for candidate, scale in candidates:
-        corners, ids, _ = detector.detectMarkers(candidate)
-        if ids is None:
-            continue
-        if scale != 1.0:
-            corners = [corner / scale for corner in corners]
-        if ROBOT_MARKER_ID in ids.flatten():
-            best_corners = corners
-            best_ids = ids
-            break
-        if best_ids is None or len(ids) > len(best_ids):
-            best_corners = corners
-            best_ids = ids
+    # Fallback unique si robust et rien detecte
+    if robust and (ids is None or ROBOT_MARKER_ID not in ids.flatten()):
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        contrast = clahe.apply(gray)
+        c2, i2, _ = detector.detectMarkers(contrast)
+        if i2 is not None and (ids is None or ROBOT_MARKER_ID in i2.flatten()):
+            corners, ids = c2, i2
 
     markers = []
-    corners = best_corners
-    ids = best_ids
     if ids is not None:
         for mc, mid in zip(corners, ids.flatten()):
             c = marker_center(mc)
@@ -245,7 +212,7 @@ def detect_aruco_markers(frame, aruco_dict, parameters, robust=False):
                 "angle_deg": float(marker_angle_deg(mc)),
                 "corners":   mc.reshape(4, 2).astype(float).tolist(),
             })
-    return markers, corners, ids
+    return markers, corners if ids is not None else [], ids
 
 
 # ---------------------------------------------------------------------------
@@ -337,9 +304,6 @@ def detect_ball(frame, min_area):
 # ---------------------------------------------------------------------------
 
 def arena_position(x, y):
-    # Champs x/y propres + anciens alias pour rester compatible avec les
-    # scripts EV3 existants. Ces valeurs ne sont pas des centimetres:
-    # ce sont des unites normalisees dans le repere mathematique de l'arene.
     return {
         "x": x,
         "y": y,
@@ -424,42 +388,28 @@ def build_state(frame, aruco_dict, parameters, qr_detector, calib,
 # ---------------------------------------------------------------------------
 
 def annotate_frame(frame, state, ball, calib, corners, ids, qrcodes):
-    # Marqueurs ArUco
-    if ids is not None:
+    if ids is not None and len(corners) > 0:
         cv2.aruco.drawDetectedMarkers(frame, corners, ids)
 
     # Robot
-    if state["robot"]:
+    if state.get("robot"):
         r = state["robot"]
-        label = "ROBOT"
-        color = (0, 255, 0)
-        if r.get("stale"):
-            label = "ROBOT memoire"
-            color = (0, 180, 255)
-        cv2.putText(frame, f"{label}  {r['x']:.1f},{r['y']:.1f} arena  {r['angle_deg']:.1f}deg",
-                    (10, frame.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
-        if r.get("center_px"):
-            x, y = map(int, r["center_px"])
-            cv2.circle(frame, (x, y), 6, color, -1)
-            angle = math.radians(r["angle_deg"])
-            tip = (
-                int(x + math.cos(angle) * 38),
-                int(y - math.sin(angle) * 38)
-            )
-            cv2.arrowedLine(frame, (x, y), tip, color, 3, tipLength=0.35)
-            cv2.putText(frame, label,
-                        (x + 10, y - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
-            cv2.putText(frame, f"{r['x']:.1f}, {r['y']:.1f} arena",
-                        (x + 10, y - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
-
-    # QR codes
-    for qr in qrcodes:
-        pts = np.asarray(qr["corners"], dtype=np.int32).reshape(-1, 1, 2)
-        cv2.polylines(frame, [pts], True, QR_COLOR, 2)
-        x, y = map(int, qr["center_px"])
-        cv2.circle(frame, (x, y), 4, QR_COLOR, -1)
-        cv2.putText(frame, "QR " + qr["data"], (x + 8, y - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, QR_COLOR, 2)
+        cx, cy = map(int, r["center_px"])
+        stale = r.get("stale", False)
+        col = (0, 200, 0) if not stale else (0, 165, 255)
+        cv2.circle(frame, (cx, cy), 6, col, -1)
+        cv2.putText(frame, "ROBOT", (cx + 8, cy - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, col, 2)
+        cv2.putText(frame, f"id={ROBOT_MARKER_ID}", (cx + 8, cy + 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1)
+        # Fleche d'orientation
+        ang = math.radians(r["angle_deg"])
+        ex = int(cx + 40 * math.cos(ang))
+        ey = int(cy - 40 * math.sin(ang))
+        cv2.arrowedLine(frame, (cx, cy), (ex, ey), col, 2, tipLength=0.3)
+        cv2.putText(frame, f"{r['x']:.1f},{r['y']:.1f} arena  {r['angle_deg']:.1f}deg",
+                    (10, frame.shape[0] - 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, col, 2)
 
     # Balle
     if ball:
@@ -527,39 +477,81 @@ def open_camera(cam_source, width, height):
 
 
 class UdpFrameReceiver:
+    """
+    Receveur UDP avec drain: vide le buffer socket a chaque appel a read()
+    pour toujours retourner la frame la plus recente disponible.
+    """
     def __init__(self, ip, port, max_packet_size):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # Buffer reception OS plus grand pour absorber les rafales
+        try:
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
+        except OSError:
+            pass
         self.sock.bind((ip, port))
         self.max_packet_size  = max_packet_size
         self.data_buffer      = {}
         self.current_frame_id = -1
+        self.last_completed_frame = None
+
+    def _handle_packet(self, packet):
+        if len(packet) < UDP_HEADER_SIZE:
+            return None
+        packet_id, frame_id = struct.unpack("II", packet[:UDP_HEADER_SIZE])
+        payload = packet[UDP_HEADER_SIZE:]
+        completed = None
+        if frame_id != self.current_frame_id:
+            # Nouvelle frame -> tenter de decoder la precedente
+            completed = self._decode()
+            self.data_buffer = {}
+            self.current_frame_id = frame_id
+        self.data_buffer[packet_id] = payload
+        return completed
 
     def read(self):
-        while True:
+        """
+        Bloque jusqu'a avoir au moins une frame, puis draine tout ce qui
+        est deja dans le socket et ne renvoie que la plus recente.
+        """
+        # 1) Lecture bloquante jusqu'a la prochaine frame complete
+        self.sock.setblocking(True)
+        latest = None
+        while latest is None:
             packet, _ = self.sock.recvfrom(self.max_packet_size)
-            if len(packet) < UDP_HEADER_SIZE:
-                continue
-            packet_id, frame_id = struct.unpack("II", packet[:UDP_HEADER_SIZE])
-            payload = packet[UDP_HEADER_SIZE:]
-            if frame_id != self.current_frame_id:
-                frame = self._decode()
-                self.data_buffer      = {}
-                self.current_frame_id = frame_id
-                self.data_buffer[packet_id] = payload
-                if frame is not None:
-                    return frame
-                continue
-            self.data_buffer[packet_id] = payload
+            done = self._handle_packet(packet)
+            if done is not None:
+                latest = done
+
+        # 2) Drain non-bloquant: si d'autres frames sont deja arrivees,
+        #    on les remplace par la plus recente.
+        self.sock.setblocking(False)
+        try:
+            while True:
+                packet, _ = self.sock.recvfrom(self.max_packet_size)
+                done = self._handle_packet(packet)
+                if done is not None:
+                    latest = done
+        except BlockingIOError:
+            pass
+        except OSError:
+            pass
+        self.sock.setblocking(True)
+
+        return latest
 
     def _decode(self):
         if self.current_frame_id == -1:
             return None
         if not self.data_buffer:
             return None
-        full_data   = b"".join(self.data_buffer[i] for i in sorted(self.data_buffer))
-        frame_data  = full_data[UDP_MESSAGE_HEADER_SIZE:]
-        frame_buf   = np.frombuffer(frame_data, dtype=np.uint8)
-        return cv2.imdecode(frame_buf, 1)
+        try:
+            full_data   = b"".join(self.data_buffer[i] for i in sorted(self.data_buffer))
+            frame_data  = full_data[UDP_MESSAGE_HEADER_SIZE:]
+            frame_buf   = np.frombuffer(frame_data, dtype=np.uint8)
+            img = cv2.imdecode(frame_buf, 1)
+            return img
+        except Exception:
+            return None
 
     def close(self):
         self.sock.close()
@@ -589,9 +581,10 @@ def main():
     parser.add_argument("--ball-min-area",  type=float, default=20.0)
     parser.add_argument("--show-mask",      action="store_true")
     parser.add_argument("--enable-qr",      action="store_true")
-    parser.add_argument("--fast-aruco",     action="store_true",
-                        help="Desactive les essais de detection ArUco renforces")
-    parser.add_argument("--robust-aruco",   action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--robust-aruco",   action="store_true",
+                        help="Active un essai supplementaire CLAHE si rien detecte (legerement plus lent)")
+    parser.add_argument("--no-display",     action="store_true",
+                        help="Desactive l'affichage OpenCV (gain de perf significatif)")
     parser.add_argument("--no-calib",       action="store_true",
                         help="Demarre sans calibration (GPS estime par largeur/hauteur image)")
     args = parser.parse_args()
@@ -609,22 +602,21 @@ def main():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
+    # ---- Parametres ArUco RAPIDES ----
     aruco_dict  = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_100)
     parameters = cv2.aruco.DetectorParameters()
-    parameters.minMarkerPerimeterRate = 0.008
-    parameters.minMarkerPerimeterRate  = 0.02   # détecte les petits marqueurs (défaut 0.03)
-    parameters.minMarkerPerimeterRate = 0.008
-    parameters.adaptiveThreshWinSizeMin = 3
-    parameters.adaptiveThreshWinSizeMax = 101
-    parameters.adaptiveThreshWinSizeStep = 4
-    parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+    parameters.adaptiveThreshWinSizeMin   = 3
+    parameters.adaptiveThreshWinSizeMax   = 23      # etait 101 (tres lent)
+    parameters.adaptiveThreshWinSizeStep  = 10      # etait 4 (faisait 25 passes)
+    parameters.minMarkerPerimeterRate     = 0.03
+    parameters.maxMarkerPerimeterRate     = 4.0
+    parameters.polygonalApproxAccuracyRate = 0.05
+    parameters.minCornerDistanceRate      = 0.05
+    parameters.minDistanceToBorder        = 3
+    parameters.cornerRefinementMethod     = cv2.aruco.CORNER_REFINE_NONE  # etait SUBPIX (lent)
+    parameters.errorCorrectionRate        = 0.6
+
     qr_detector = cv2.QRCodeDetector()
-    parameters.maxMarkerPerimeterRate = 4.0
-    parameters.adaptiveThreshWinSizeMax = 101
-    parameters.polygonalApproxAccuracyRate = 0.08
-    parameters.minCornerDistanceRate = 0.02
-    parameters.minDistanceToBorder = 2
-    parameters.errorCorrectionRate = 0.8
     object_memory = {}
 
     def get_frame():
@@ -657,6 +649,11 @@ def main():
         if calib is None:
             print("Calibration annulee, GPS estime par largeur/hauteur image.")
 
+    # Stats FPS
+    fps_t0 = time.time()
+    fps_n  = 0
+    fps_val = 0.0
+
     # Boucle principale
     while True:
         frame = get_frame()
@@ -672,9 +669,9 @@ def main():
             calib,
             object_memory,
             args.enable_qr,
-            not args.fast_aruco
+            args.robust_aruco
         )
-        ball, ball_mask              = detect_ball(frame, args.ball_min_area)
+        ball, ball_mask = detect_ball(frame, args.ball_min_area)
 
         if ball:
             pos = point_to_arena(ball["center_px"], frame.shape, calib)
@@ -696,16 +693,33 @@ def main():
                 state["ball"]["stale"] = True
                 state["ball"]["age"] = age
 
-        annotate_frame(frame, state, ball, calib, corners, ids, qrcodes)
+        # Envoi UDP avant l'affichage (latence min sur le robot)
+        try:
+            sock.sendto(json.dumps(state).encode("utf-8"), (args.robot_ip, args.port))
+        except OSError:
+            pass
 
-        sock.sendto(json.dumps(state).encode("utf-8"), (args.robot_ip, args.port))
+        # FPS
+        fps_n += 1
+        now = time.time()
+        if now - fps_t0 >= 1.0:
+            fps_val = fps_n / (now - fps_t0)
+            fps_n = 0
+            fps_t0 = now
 
-        cv2.imshow("vision_server", frame)
-        if args.show_mask:
-            cv2.imshow("ball_mask", ball_mask)
-
-        if cv2.waitKey(1) & 0xFF in (ord('q'), ord('Q')):
-            break
+        if not args.no_display:
+            annotate_frame(frame, state, ball, calib, corners, ids, qrcodes)
+            cv2.putText(frame, f"{fps_val:.1f} FPS", (10, 22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            cv2.imshow("vision_server", frame)
+            if args.show_mask:
+                cv2.imshow("ball_mask", ball_mask)
+            if cv2.waitKey(1) & 0xFF in (ord('q'), ord('Q')):
+                break
+        else:
+            # Sans affichage on imprime le FPS de temps en temps
+            if fps_n == 0 and fps_val > 0:
+                print(f"FPS={fps_val:.1f}", end="\r")
 
     if frame_receiver: frame_receiver.close()
     if camera0:        camera0.release()
