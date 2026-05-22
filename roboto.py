@@ -1,27 +1,10 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 """
 Robot de football - controle clavier via SSH
-- Port 3  : Capteur ultrason fixe a l'avant
-- Port A  : Roue gauche
-- Port C  : Pelle mecanique
-- Port D  : Roue droite
-
-Controles :
-  Z / Fleche haut    -> Avancer (maintenir)
-  S / Fleche bas     -> Reculer (maintenir)
-  Q / Fleche gauche  -> Tourner gauche (maintenir)
-  D / Fleche droite  -> Tourner droite (maintenir)
-  T                  -> Tir pelle
-  H                  -> Bloquer la pelle ou elle est
-  1 / 2              -> Regler pelle bas/haut
-  3                  -> Monter pelle jusqu'a la position haute de frappe
-  0                  -> Mettre position pelle actuelle a zero
-  9                  -> Afficher position pelle
-  A                  -> Mode auto
-  X / rien           -> Stop
-  Ctrl+C             -> Quitter
 """
- 
+
 import sys
 import tty
 import termios
@@ -30,59 +13,56 @@ import time
 import socket
 import json
 import math
-import mock_strategie as commande
-import test_strategie as strategie
+
 from ev3dev2.motor import LargeMotor, Motor, OUTPUT_A, OUTPUT_C, OUTPUT_D
 from ev3dev2.sensor.lego import UltrasonicSensor
 from ev3dev2.sensor import INPUT_3
 from ev3dev2.sound import Sound
- 
-# ── Initialisation ──────────────────────────────────────────────────────────
-sound       = Sound()
-left_motor  = LargeMotor(OUTPUT_A)
+
+
+sound = Sound()
+left_motor = LargeMotor(OUTPUT_A)
 right_motor = LargeMotor(OUTPUT_D)
-scoop_motor = Motor(OUTPUT_C)        # pelle mecanique (medium ou large)
-us_sensor   = UltrasonicSensor(INPUT_3)
+scoop_motor = Motor(OUTPUT_C)
+us_sensor = UltrasonicSensor(INPUT_3)
 us_sensor.mode = 'US-DIST-CM'
- 
-# ── Parametres ───────────────────────────────────────────────────────────────
-DRIVE_SPEED      = 50
-TURN_SPEED       = 25
-SCOOP_KICK_ANGLE  = 70    # tir relatif depuis la position actuelle, mieux au milieu
-SCOOP_UP_SPEED   = 100   # vitesse de frappe vers le haut
-SCOOP_DOWN_SPEED = -55   # retour controle vers le bas
-SCOOP_ADJUST_STEP = 4    # degres moteur pour le reglage manuel
 
-SHOOT_DIST       = 15.5  # cm - balle collee au robot: on tire
-DETECT_DIST      = 38.0  # cm - balle detectee: on approche doucement
-OBSTACLE_DIST    = DETECT_DIST
-SLOWDOWN_DIST    = 100.0 # cm - a partir d'ici le robot ralentit progressivement
-FREE_DIST        = 45.0  # cm - direction consideree libre apres scan
-MAX_VALID_DIST   = 200   # cm - au-dela on considere l'echo comme perdu
-HIT_CONFIRM      = 1     # tir des la premiere detection
-SHOT_COOLDOWN    = 1.5   # secondes - evite de tirer en boucle
-POST_SHOT_CHECK_TIME = 0.25 # secondes - laisse le temps a la balle de partir
-MIN_AUTO_SPEED   = 18    # vitesse minimale quand un obstacle approche
-POST_TURN_FORWARD_TIME = 0.9  # secondes - evite de rescanner en boucle apres virage
 
-STUCK_WATCH_DIST = 130.0 # cm - on surveille le blocage quand la distance devrait changer
-STUCK_TIME       = 1.2   # secondes avec roues qui tournent mais distance stable
-STUCK_MOTOR_DEG  = 160   # degres moteurs minimum pour dire que les roues ont tourne
-STUCK_DIST_DELTA = 4.0   # cm - distance quasi inchangee => robot probablement bloque
-LOST_ECHO_TIME   = 0.9   # secondes sans echo avant recuperation
-LOST_ECHO_SPEED  = 14    # vitesse prudente si l'echo est instable
+DRIVE_SPEED = 50
+TURN_SPEED = 25
 
-SCAN_ANGLE       = 35    # degres robot pour regarder gauche/droite
-ESCAPE_ANGLE     = 75    # degres robot si gauche et droite sont bloques
-MAX_STUCK_TRIES  = 3     # anti-boucle: stop auto apres plusieurs echecs
+SCOOP_KICK_ANGLE = 70
+SCOOP_UP_SPEED = 100
+SCOOP_DOWN_SPEED = -55
+SCOOP_ADJUST_STEP = 4
 
-# A calibrer: degres moteur necessaires pour tourner le robot de 1 degre.
-# Avec des grandes roues EV3 et une voie autour de 14 cm, 2.4 est un bon depart.
+SHOOT_DIST = 15.5
+DETECT_DIST = 38.0
+OBSTACLE_DIST = DETECT_DIST
+SLOWDOWN_DIST = 100.0
+FREE_DIST = 45.0
+MAX_VALID_DIST = 200
+HIT_CONFIRM = 1
+SHOT_COOLDOWN = 1.5
+POST_SHOT_CHECK_TIME = 0.25
+MIN_AUTO_SPEED = 18
+POST_TURN_FORWARD_TIME = 0.9
+
+STUCK_WATCH_DIST = 130.0
+STUCK_TIME = 1.2
+STUCK_MOTOR_DEG = 160
+STUCK_DIST_DELTA = 4.0
+LOST_ECHO_TIME = 0.9
+LOST_ECHO_SPEED = 14
+
+SCAN_ANGLE = 35
+ESCAPE_ANGLE = 75
+MAX_STUCK_TRIES = 3
 TURN_MOTOR_DEG_PER_ROBOT_DEG = 2.4
 
-SPEED_STEP       = 5     # increment pour +/-
-SPEED_MIN        = 10
-SPEED_MAX        = 100
+SPEED_STEP = 5
+SPEED_MIN = 10
+SPEED_MAX = 100
 
 CAMERA_STATE_PORT = 8081
 CAMERA_STATE_MAX_AGE = 0.6
@@ -91,34 +71,45 @@ CAMERA_CONTACT_DIST = 23.0
 CAMERA_APPROACH_DIST = 80.0
 CAMERA_SLOW_SPEED = 22
 CAMERA_TURN_SPEED = 22
-ULTRASON_OBSTACLE_MAX_DIST = OBSTACLE_DIST
-ULTRASON_BALL_MATCH_TOLERANCE = 12.0
-VIRTUAL_OBSTACLE_FAR_CM = 9999.0
- 
-# ── Etat des touches ─────────────────────────────────────────────────────────
+CAMERA_VERBOSE_INTERVAL = 0.25
+
+AUTO_VERBOSE = True
+
+ARENA_W_CM = 301.0
+ARENA_H_CM = 390.0
+ARENA_MARGIN_CM = 35.0
+ARENA_CRITICAL_MARGIN_CM = 18.0
+ARENA_CENTER_X = ARENA_W_CM / 2.0
+ARENA_CENTER_Y = ARENA_H_CM / 2.0
+ARENA_ESCAPE_SPEED = 20
+
+
 keys = {
-    'up':    False,
-    'down':  False,
-    'left':  False,
+    'up': False,
+    'down': False,
+    'left': False,
     'right': False,
 }
-running      = True
-auto_mode    = False
-turn_samples = []   # distances enregistrees via 'u' pour calibration
+
+running = True
+auto_mode = False
+turn_samples = []
 latest_camera_state = None
 camera_lock = threading.Lock()
 camera_last_shot = 0
 camera_escape_dir = 1
- 
-# ── Moteurs ──────────────────────────────────────────────────────────────────
- 
+last_camera_verbose = 0
+
+
 def drive(left, right):
     left_motor.on(left)
     right_motor.on(right)
- 
+
+
 def stop():
     left_motor.off(brake=True)
     right_motor.off(brake=True)
+
 
 def backward(duration=0.35):
     drive(-DRIVE_SPEED, -DRIVE_SPEED)
@@ -126,8 +117,8 @@ def backward(duration=0.35):
     stop()
     time.sleep(0.1)
 
+
 def turn_by_angle(angle_deg):
-    """Tourne le robot sur place. + = droite, - = gauche."""
     motor_degrees = int(abs(angle_deg) * TURN_MOTOR_DEG_PER_ROBOT_DEG)
     motor_degrees = max(30, motor_degrees)
 
@@ -138,74 +129,46 @@ def turn_by_angle(angle_deg):
         left_speed = -TURN_SPEED
         right_speed = TURN_SPEED
 
-    left_motor.on_for_degrees(
-        speed=left_speed,
-        degrees=motor_degrees,
-        brake=True,
-        block=False
-    )
-    right_motor.on_for_degrees(
-        speed=right_speed,
-        degrees=motor_degrees,
-        brake=True,
-        block=True
-    )
+    left_motor.on_for_degrees(speed=left_speed, degrees=motor_degrees, brake=True, block=False)
+    right_motor.on_for_degrees(speed=right_speed, degrees=motor_degrees, brake=True, block=True)
     left_motor.wait_until_not_moving(timeout=2000)
     stop()
     time.sleep(0.15)
- 
+
+
 def lower_scoop():
-    """Ne bouge plus la pelle: on garde la position reglee a la main."""
     scoop_motor.off(brake=True)
     print("\r[PELLE] tenue au milieu position={}       ".format(scoop_motor.position), end='')
 
+
 def scoop():
-    """Tir relatif depuis le milieu: haut a fond puis retour au point de depart."""
     start_pos = scoop_motor.position
-    scoop_motor.on_for_degrees(
-        speed=SCOOP_UP_SPEED,
-        degrees=SCOOP_KICK_ANGLE,
-        brake=False,
-        block=True
-    )
-    scoop_motor.on_for_degrees(
-        speed=SCOOP_DOWN_SPEED,
-        degrees=SCOOP_KICK_ANGLE,
-        brake=True,
-        block=True
-    )
+    scoop_motor.on_for_degrees(speed=SCOOP_UP_SPEED, degrees=SCOOP_KICK_ANGLE, brake=False, block=True)
+    scoop_motor.on_for_degrees(speed=SCOOP_DOWN_SPEED, degrees=SCOOP_KICK_ANGLE, brake=True, block=True)
     print("\r[PELLE] tir {} -> {}       ".format(start_pos, scoop_motor.position), end='')
 
+
 def raise_scoop_to_hit():
-    """Monte un peu la pelle pour tester le haut, sans retour automatique."""
-    scoop_motor.on_for_degrees(
-        speed=SCOOP_UP_SPEED,
-        degrees=SCOOP_KICK_ANGLE,
-        brake=True,
-        block=True
-    )
+    scoop_motor.on_for_degrees(speed=SCOOP_UP_SPEED, degrees=SCOOP_KICK_ANGLE, brake=True, block=True)
     print("\r[PELLE] position haute test={}       ".format(scoop_motor.position), end='')
 
+
 def adjust_scoop(degrees):
-    """Petit reglage manuel de la pelle pendant les tests."""
     speed = 25 if degrees > 0 else -25
-    scoop_motor.on_for_degrees(
-        speed=speed,
-        degrees=abs(degrees),
-        brake=True,
-        block=True
-    )
+    scoop_motor.on_for_degrees(speed=speed, degrees=abs(degrees), brake=True, block=True)
     print("\r[PELLE] position={}       ".format(scoop_motor.position), end='')
+
 
 def reset_scoop_position():
     scoop_motor.reset()
     print("\r[PELLE] position remise a zero       ", end='')
 
+
 def print_scoop_position():
     print("\r[PELLE] position={}       ".format(scoop_motor.position), end='')
 
+
 def read_distance(samples=3, delay=0.03):
-    """Lit plusieurs fois l'ultrason et renvoie une valeur stable."""
     values = []
     for _ in range(samples):
         d = us_sensor.distance_centimeters
@@ -219,11 +182,12 @@ def read_distance(samples=3, delay=0.03):
     values.sort()
     return values[len(values) // 2]
 
+
 def dist():
     return read_distance(samples=1, delay=0)
 
+
 def auto_speed_for_distance(distance):
-    """Vitesse progressive: rapide loin, prudente pres d'un obstacle."""
     if distance >= SLOWDOWN_DIST:
         return DRIVE_SPEED
     if distance <= OBSTACLE_DIST:
@@ -232,11 +196,100 @@ def auto_speed_for_distance(distance):
     ratio = (distance - OBSTACLE_DIST) / float(SLOWDOWN_DIST - OBSTACLE_DIST)
     return int(MIN_AUTO_SPEED + ratio * (DRIVE_SPEED - MIN_AUTO_SPEED))
 
+
 def is_valid_distance(distance):
     return distance is not None and distance < MAX_VALID_DIST
 
+
 def angle_diff(target, current):
     return (target - current + 180) % 360 - 180
+
+
+def arena_edges(robot):
+    x = robot["x_cm"]
+    y = robot["y_cm"]
+    return {
+        "G": x,
+        "D": ARENA_W_CM - x,
+        "H": y,
+        "B": ARENA_H_CM - y,
+    }
+
+
+def log_camera_verbose(robot, ball, ball_dist, diff):
+    global last_camera_verbose
+
+    if not AUTO_VERBOSE:
+        return
+
+    now = time.time()
+    if now - last_camera_verbose < CAMERA_VERBOSE_INTERVAL:
+        return
+
+    edges = arena_edges(robot)
+    print(
+        "\r\n[CAMERA] robot=({:.1f},{:.1f}) angle={:.1f} "
+        "balle=({:.1f},{:.1f}) dist={:.1f} diff={:.1f} "
+        "bords G={:.1f} D={:.1f} H={:.1f} B={:.1f}".format(
+            robot["x_cm"],
+            robot["y_cm"],
+            robot.get("angle_deg", 0.0),
+            ball["x_cm"],
+            ball["y_cm"],
+            ball_dist,
+            diff,
+            edges["G"],
+            edges["D"],
+            edges["H"],
+            edges["B"],
+        ),
+        end=''
+    )
+
+    last_camera_verbose = now
+
+
+def keep_inside_arena(robot):
+    edges = arena_edges(robot)
+    closest = min(edges.values())
+
+    if closest > ARENA_MARGIN_CM:
+        return False
+
+    target_angle = math.degrees(math.atan2(
+        ARENA_CENTER_Y - robot["y_cm"],
+        ARENA_CENTER_X - robot["x_cm"]
+    ))
+    robot_angle = robot.get("angle_deg", 0.0)
+    diff = angle_diff(target_angle, robot_angle)
+
+    level = "CRITIQUE" if closest <= ARENA_CRITICAL_MARGIN_CM else "MARGE"
+    print(
+        "\r\n[LIMITE] {} robot=({:.1f},{:.1f}) angle={:.1f} "
+        "bords G={:.1f} D={:.1f} H={:.1f} B={:.1f} -> centre diff={:.1f}".format(
+            level,
+            robot["x_cm"],
+            robot["y_cm"],
+            robot_angle,
+            edges["G"],
+            edges["D"],
+            edges["H"],
+            edges["B"],
+            diff,
+        ),
+        end=''
+    )
+
+    if abs(diff) > CAMERA_ANGLE_OK:
+        if diff > 0:
+            drive(CAMERA_TURN_SPEED, -CAMERA_TURN_SPEED)
+        else:
+            drive(-CAMERA_TURN_SPEED, CAMERA_TURN_SPEED)
+    else:
+        drive(ARENA_ESCAPE_SPEED, ARENA_ESCAPE_SPEED)
+
+    return True
+
 
 def camera_state_thread():
     global latest_camera_state
@@ -246,10 +299,13 @@ def camera_state_thread():
     sock.bind(("", CAMERA_STATE_PORT))
     sock.settimeout(0.2)
 
+    print("\r\n[CAMERA] attente UDP port {}".format(CAMERA_STATE_PORT))
+
     while running:
         try:
             data, _ = sock.recvfrom(4096)
             state = json.loads(data.decode("utf-8"))
+            state["_rx_ts"] = time.time()
             with camera_lock:
                 latest_camera_state = state
         except socket.timeout:
@@ -259,155 +315,133 @@ def camera_state_thread():
 
     sock.close()
 
+
 def get_fresh_camera_state():
     with camera_lock:
         state = latest_camera_state
 
     if not state:
         return None
-    if time.time() - state.get("ts", 0) > CAMERA_STATE_MAX_AGE:
+    if time.time() - state.get("_rx_ts", 0) > CAMERA_STATE_MAX_AGE:
         return None
     if not state.get("robot") or not state.get("ball"):
         return None
     return state
 
-def build_strategy_state(camera_state, distance):
-    """Convertit vision + ultrason vers le format de test_strategie."""
-    vision_robot = camera_state["robot"]
-    vision_ball = camera_state["ball"]
-
-    robot = {
-        "x_cm": float(vision_robot["x_cm"]),
-        "y_cm": float(vision_robot["y_cm"]),
-        "angle": float(vision_robot.get("angle_deg", 0.0)),
-    }
-    ball = {
-        "x_cm": float(vision_ball["x_cm"]),
-        "y_cm": float(vision_ball["y_cm"]),
-    }
-
-    obstacle = {
-        "x_cm": VIRTUAL_OBSTACLE_FAR_CM,
-        "y_cm": VIRTUAL_OBSTACLE_FAR_CM,
-    }
-
-    if is_valid_distance(distance) and distance <= ULTRASON_OBSTACLE_MAX_DIST:
-        dx_ball = ball["x_cm"] - robot["x_cm"]
-        dy_ball = ball["y_cm"] - robot["y_cm"]
-        ball_dist = math.hypot(dx_ball, dy_ball)
-        ball_angle = math.degrees(math.atan2(dy_ball, dx_ball))
-        ball_in_front = abs(angle_diff(ball_angle, robot["angle"])) <= strategie.ANGLE_DETECTION
-        ultrason_matches_ball = (
-            ball_in_front and
-            abs(ball_dist - distance) <= ULTRASON_BALL_MATCH_TOLERANCE
-        )
-
-        if not ultrason_matches_ball:
-            rad = math.radians(robot["angle"])
-            obstacle = {
-                "x_cm": robot["x_cm"] + math.cos(rad) * distance,
-                "y_cm": robot["y_cm"] + math.sin(rad) * distance,
-            }
-
-    return robot, ball, obstacle
-
-def apply_strategy_command(cmd, now):
-    """Applique une commande mock_strategie sur les vrais moteurs EV3."""
-    global camera_last_shot
-
-    action = cmd.get("action", "stop")
-    vitesse = int(cmd.get("vitesse", 0))
-
-    if action == "avance":
-        drive(vitesse, vitesse)
-    elif action == "recule":
-        drive(-vitesse, -vitesse)
-    elif action == "tourneD":
-        drive(vitesse, -vitesse)
-    elif action == "tourneG":
-        drive(-vitesse, vitesse)
-    elif action == "tir":
-        stop()
-        if now - camera_last_shot >= SHOT_COOLDOWN:
-            print("\r\n[STRATEGIE] TIR")
-            scoop()
-            camera_last_shot = time.time()
-        commande.stop()
-    else:
-        stop()
 
 def camera_auto_step(state, d, now):
-    robot, ball, obstacle = build_strategy_state(state, d)
-    strategie.jouer_tour(robot, ball, obstacle)
-    cmd = commande.get_etat()
-    apply_strategy_command(cmd, now)
+    global camera_last_shot, camera_escape_dir
+
+    robot = state["robot"]
+    ball = state["ball"]
+
+    dx = ball["x_cm"] - robot["x_cm"]
+    dy = ball["y_cm"] - robot["y_cm"]
+    ball_dist = math.hypot(dx, dy)
+    target_angle = math.degrees(math.atan2(dy, dx))
+    diff = angle_diff(target_angle, robot.get("angle_deg", 0.0))
+
+    log_camera_verbose(robot, ball, ball_dist, diff)
+
+    if keep_inside_arena(robot):
+        return True
+
+    if d <= OBSTACLE_DIST and ball_dist > CAMERA_APPROACH_DIST:
+        stop()
+        print("\r\n[CAMERA] obstacle ultrason devant, balle ailleurs - securite")
+        return False
+
+    if ball_dist <= CAMERA_CONTACT_DIST and now - camera_last_shot >= SHOT_COOLDOWN:
+        stop()
+        print("\r\n[CAMERA] balle au contact ({:.1f}cm) - TIR".format(ball_dist))
+        scoop()
+        time.sleep(POST_SHOT_CHECK_TIME)
+        after_shot_d = read_distance()
+        camera_last_shot = time.time()
+
+        if after_shot_d <= DETECT_DIST:
+            print("\r\n[CAMERA] objet encore devant apres tir ({:.1f}cm) - RECUL + SCAN".format(after_shot_d))
+            camera_escape_dir, _ = recover_from_obstacle(1, camera_escape_dir)
+
+        return True
+
+    if abs(diff) > CAMERA_ANGLE_OK:
+        if diff > 0:
+            drive(CAMERA_TURN_SPEED, -CAMERA_TURN_SPEED)
+        else:
+            drive(-CAMERA_TURN_SPEED, CAMERA_TURN_SPEED)
+    else:
+        speed = CAMERA_SLOW_SPEED if ball_dist <= DETECT_DIST else DRIVE_SPEED
+        drive(speed, speed)
+
     return True
 
-# ── Thread lecture clavier ────────────────────────────────────────────────────
- 
-KEY_TIMEOUT = 0.15  # secondes - si pas de touche recue, on considere relachee
- 
+
+KEY_TIMEOUT = 0.15
+
+
 def read_keys():
-    """
-    Lit les touches en continu.
-    Met a jour le dictionnaire keys[].
-    Une touche est consideree relachee si elle n'est pas re-recue
-    dans KEY_TIMEOUT secondes.
-    """
     global running, auto_mode, DRIVE_SPEED
- 
-    fd  = sys.stdin.fileno()
+
+    fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     tty.setraw(fd)
- 
+
     last_time = {}
- 
+
     try:
         import select
+
         while running:
             r, _, _ = select.select([sys.stdin], [], [], KEY_TIMEOUT)
- 
-            # Marque les touches comme relachees si timeout depasse
+
             now = time.time()
             for k in keys:
                 if k in last_time and now - last_time[k] > KEY_TIMEOUT:
                     keys[k] = False
- 
+
             if not r:
                 continue
- 
+
             ch = sys.stdin.read(1)
- 
-            # Ctrl+C
+
             if ch == '\x03':
                 running = False
                 break
- 
-            # Sequences fleches
+
             if ch == '\x1b':
                 ch2 = sys.stdin.read(1)
                 ch3 = sys.stdin.read(1)
                 seq = ch + ch2 + ch3
+
                 if seq == '\x1b[A':
-                    keys['up']    = True; last_time['up']    = time.time()
+                    keys['up'] = True
+                    last_time['up'] = time.time()
                 elif seq == '\x1b[B':
-                    keys['down']  = True; last_time['down']  = time.time()
+                    keys['down'] = True
+                    last_time['down'] = time.time()
                 elif seq == '\x1b[D':
-                    keys['left']  = True; last_time['left']  = time.time()
+                    keys['left'] = True
+                    last_time['left'] = time.time()
                 elif seq == '\x1b[C':
-                    keys['right'] = True; last_time['right'] = time.time()
+                    keys['right'] = True
+                    last_time['right'] = time.time()
                 continue
- 
+
             ch = ch.lower()
- 
+
             if ch == 'z':
-                keys['up']    = True; last_time['up']    = time.time()
+                keys['up'] = True
+                last_time['up'] = time.time()
             elif ch == 's':
-                keys['down']  = True; last_time['down']  = time.time()
+                keys['down'] = True
+                last_time['down'] = time.time()
             elif ch == 'q':
-                keys['left']  = True; last_time['left']  = time.time()
+                keys['left'] = True
+                last_time['left'] = time.time()
             elif ch == 'd':
-                keys['right'] = True; last_time['right'] = time.time()
+                keys['right'] = True
+                last_time['right'] = time.time()
             elif ch == 't':
                 t = threading.Thread(target=scoop)
                 t.daemon = True
@@ -435,11 +469,8 @@ def read_keys():
             elif ch == 'a':
                 auto_mode = not auto_mode
                 if auto_mode:
-                    strategie.reset()
-                    commande.stop()
                     print("\r-> Mode AUTO ON       ", end='')
                 else:
-                    commande.stop()
                     print("\r-> Mode AUTO OFF      ", end='')
             elif ch == 'x':
                 for k in keys:
@@ -455,21 +486,16 @@ def read_keys():
                 d = dist()
                 turn_samples.append(d)
                 avg = sum(turn_samples) / len(turn_samples)
-                mn  = min(turn_samples)
-                mx  = max(turn_samples)
-                print("\r[CALIB] #{} dist={:.1f}cm  (min={:.1f} max={:.1f} moy={:.1f})        ".format(
+                mn = min(turn_samples)
+                mx = max(turn_samples)
+                print("\r[CALIB] #{} dist={:.1f}cm (min={:.1f} max={:.1f} moy={:.1f})        ".format(
                     len(turn_samples), d, mn, mx, avg), end='')
- 
+
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
- 
-# ── Thread mode auto ──────────────────────────────────────────────────────────
+
 
 def scan_direction():
-    """
-    Le capteur est fixe: pour comparer gauche/droite, on tourne le robot.
-    Retourne l'angle a prendre (-SCAN_ANGLE ou +SCAN_ANGLE), ou None si bloque.
-    """
     stop()
     time.sleep(0.1)
 
@@ -506,10 +532,11 @@ def scan_direction():
 
     if best_angle is None or best_d < FREE_DIST:
         return None
+
     return best_angle
 
+
 def recover_from_obstacle(stuck_count, escape_dir):
-    """Recule, compare gauche/droite, puis s'oriente vers le meilleur cote."""
     backward(0.7 + 0.2 * min(stuck_count, 3))
     best_angle = scan_direction()
 
@@ -520,18 +547,19 @@ def recover_from_obstacle(stuck_count, escape_dir):
     turn_by_angle(ESCAPE_ANGLE * escape_dir)
     return -escape_dir, False
 
+
 def auto_thread():
     global auto_mode
-    last_log       = 0
-    close_count    = 0
-    obstacle_count = 0
-    stuck_count    = 0
-    escape_dir     = 1
-    last_shot      = 0
-    last_valid_d   = SLOWDOWN_DIST
-    forward_until  = 0
-    stuck_start    = 0
-    stuck_start_d  = 0
+
+    last_log = 0
+    close_count = 0
+    stuck_count = 0
+    escape_dir = 1
+    last_shot = 0
+    last_valid_d = SLOWDOWN_DIST
+    forward_until = 0
+    stuck_start = 0
+    stuck_start_d = 0
     stuck_left_pos = 0
     stuck_right_pos = 0
     lost_echo_start = 0
@@ -540,6 +568,7 @@ def auto_thread():
         if auto_mode:
             raw_d = read_distance()
             now = time.time()
+
             lost_echo = raw_d >= 999
             if lost_echo:
                 if lost_echo_start == 0:
@@ -564,8 +593,10 @@ def auto_thread():
                     tag = "APPROCHE_LENTE"
                 else:
                     tag = "AVANCE"
+
                 speed = LOST_ECHO_SPEED if lost_echo else auto_speed_for_distance(d)
                 echo = " echo_perdu" if lost_echo else ""
+
                 print("\r\n[AUTO] d={:.1f}cm v={} tir<={:.1f} obstacle<={:.1f} -> {}{}".format(
                     d, speed, SHOOT_DIST, DETECT_DIST, tag, echo), end='')
                 last_log = now
@@ -584,13 +615,13 @@ def auto_thread():
                     escape_dir *= -1
 
                 close_count = 0
-                obstacle_count = 0
                 stuck_start = 0
                 lost_echo_start = 0
                 forward_until = time.time() + POST_TURN_FORWARD_TIME
+
             elif d <= SHOOT_DIST:
                 close_count += 1
-                obstacle_count = 0
+
                 if close_count >= HIT_CONFIRM and now - last_shot >= SHOT_COOLDOWN:
                     stop()
                     print("\r\n[AUTO] >>> Balle au contact a {:.1f}cm - TIR".format(d))
@@ -606,6 +637,7 @@ def auto_thread():
                         print("\r\n[AUTO] >>> Objet encore devant apres tir ({:.1f}cm) - RECUL + SCAN".format(
                             after_shot_d))
                         escape_dir, found_free = recover_from_obstacle(stuck_count, escape_dir)
+
                         if found_free:
                             stuck_count = 0
                         elif stuck_count >= MAX_STUCK_TRIES:
@@ -613,25 +645,27 @@ def auto_thread():
                             sound.speak("Bloque")
                             print("\r\n[AUTO] >>> Bloque apres {} essais - AUTO OFF".format(stuck_count))
                             auto_mode = False
+
                         forward_until = time.time() + POST_TURN_FORWARD_TIME
                     else:
                         stuck_count = 0
                         backward(0.2)
                 else:
                     stop()
+
                 stuck_start = 0
+
             elif now < forward_until:
                 close_count = 0
-                obstacle_count = 0
                 speed = LOST_ECHO_SPEED if lost_echo else max(MIN_AUTO_SPEED, auto_speed_for_distance(d))
                 drive(speed, speed)
+
             elif d <= DETECT_DIST:
-                obstacle_count = 0
                 close_count = 0
                 drive(MIN_AUTO_SPEED, MIN_AUTO_SPEED)
+
             else:
                 close_count = 0
-                obstacle_count = 0
                 speed = LOST_ECHO_SPEED if lost_echo else auto_speed_for_distance(d)
                 drive(speed, speed)
 
@@ -671,21 +705,21 @@ def auto_thread():
                         stuck_start = 0
             else:
                 stuck_start = 0
+
         time.sleep(0.05)
- 
-# ── Thread controle moteurs ───────────────────────────────────────────────────
- 
+
+
 def motor_thread():
     while running:
         if auto_mode:
             time.sleep(0.05)
             continue
- 
-        up    = keys['up']
-        down  = keys['down']
-        left  = keys['left']
+
+        up = keys['up']
+        down = keys['down']
+        left = keys['left']
         right = keys['right']
- 
+
         if up and left:
             drive(DRIVE_SPEED // 2, DRIVE_SPEED)
         elif up and right:
@@ -704,17 +738,16 @@ def motor_thread():
             drive(TURN_SPEED, -TURN_SPEED)
         else:
             stop()
- 
+
         time.sleep(0.05)
- 
-# ── Main ──────────────────────────────────────────────────────────────────────
- 
+
+
 def main():
     global running
- 
+
     sound.speak("Pret")
- 
-    print("=== ROBOT FOOTBALL ===")
+
+    print("ROBOT FOOTBALL")
     print("Z/Haut    : Avancer")
     print("S/Bas     : Reculer")
     print("Q/Gauche  : Gauche")
@@ -727,20 +760,22 @@ def main():
     print("A         : Mode auto")
     print("X         : Stop")
     print("P / M     : Ajuster DRIVE_SPEED (+/- {})".format(SPEED_STEP))
-    print("U         : Enregistrer distance (calibration)")
+    print("U         : Enregistrer distance calibration")
     print("Ctrl+C    : Quitter")
-    print("======================")
- 
-    t_auto   = threading.Thread(target=auto_thread)
-    t_motor  = threading.Thread(target=motor_thread)
+    print("                           ")
+
+    t_auto = threading.Thread(target=auto_thread)
+    t_motor = threading.Thread(target=motor_thread)
     t_camera = threading.Thread(target=camera_state_thread)
-    t_auto.daemon   = True
-    t_motor.daemon  = True
+
+    t_auto.daemon = True
+    t_motor.daemon = True
     t_camera.daemon = True
+
     t_auto.start()
     t_motor.start()
     t_camera.start()
- 
+
     try:
         read_keys()
     except KeyboardInterrupt:
@@ -751,14 +786,15 @@ def main():
         scoop_motor.off(brake=True)
         sound.speak("Arret")
         print("\nRobot arrete.")
+
         if turn_samples:
             avg = sum(turn_samples) / len(turn_samples)
-            print("=== CALIBRATION ===")
             print("Echantillons ({}): {}".format(
                 len(turn_samples),
                 ", ".join("{:.1f}".format(s) for s in turn_samples)))
             print("Min = {:.1f}cm  Max = {:.1f}cm  Moyenne = {:.1f}cm".format(
                 min(turn_samples), max(turn_samples), avg))
- 
+
+
 if __name__ == '__main__':
     main()
