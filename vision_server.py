@@ -25,7 +25,7 @@ import numpy as np
 
 
 ROBOT_MARKER_ID = 67
-ROBOT_MEMORY_SECONDS = 0.8
+ROBOT_MEMORY_SECONDS = 1.2
 BALL_MEMORY_SECONDS = 0.8
 
 ARENA_W_UNITS = 255.0
@@ -202,7 +202,12 @@ def aruco_frame_variants(frame):
     contrast = clahe.apply(gray)
     blur = cv2.GaussianBlur(contrast, (0, 0), 1.0)
     sharp = cv2.addWeighted(contrast, 1.6, blur, -0.6, 0)
-    return [gray, contrast, sharp]
+    variants = [gray, contrast, sharp]
+    enlarged = [
+        cv2.resize(image, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+        for image in variants
+    ]
+    return [(image, 1.0) for image in variants] + [(image, 2.0) for image in enlarged]
 
 def detect_aruco_markers(frame, aruco_dict, parameters, robust=False):
     detector        = cv2.aruco.ArucoDetector(aruco_dict, parameters)
@@ -212,12 +217,14 @@ def detect_aruco_markers(frame, aruco_dict, parameters, robust=False):
     if robust:
         candidates = aruco_frame_variants(frame)
     else:
-        candidates = [cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)]
+        candidates = [(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), 1.0)]
 
-    for candidate in candidates:
+    for candidate, scale in candidates:
         corners, ids, _ = detector.detectMarkers(candidate)
         if ids is None:
             continue
+        if scale != 1.0:
+            corners = [corner / scale for corner in corners]
         if ROBOT_MARKER_ID in ids.flatten():
             best_corners = corners
             best_ids = ids
@@ -582,7 +589,9 @@ def main():
     parser.add_argument("--ball-min-area",  type=float, default=20.0)
     parser.add_argument("--show-mask",      action="store_true")
     parser.add_argument("--enable-qr",      action="store_true")
-    parser.add_argument("--robust-aruco",   action="store_true")
+    parser.add_argument("--fast-aruco",     action="store_true",
+                        help="Desactive les essais de detection ArUco renforces")
+    parser.add_argument("--robust-aruco",   action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--no-calib",       action="store_true",
                         help="Demarre sans calibration (GPS estime par largeur/hauteur image)")
     args = parser.parse_args()
@@ -602,13 +611,14 @@ def main():
 
     aruco_dict  = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_100)
     parameters = cv2.aruco.DetectorParameters()
+    parameters.minMarkerPerimeterRate = 0.008
     parameters.minMarkerPerimeterRate  = 0.02   # détecte les petits marqueurs (défaut 0.03)
+    parameters.minMarkerPerimeterRate = 0.008
     parameters.adaptiveThreshWinSizeMin = 3
-    parameters.adaptiveThreshWinSizeMax = 50
+    parameters.adaptiveThreshWinSizeMax = 101
     parameters.adaptiveThreshWinSizeStep = 4
     parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
     qr_detector = cv2.QRCodeDetector()
-    parameters.minMarkerPerimeterRate = 0.01
     parameters.maxMarkerPerimeterRate = 4.0
     parameters.adaptiveThreshWinSizeMax = 101
     parameters.polygonalApproxAccuracyRate = 0.08
@@ -662,7 +672,7 @@ def main():
             calib,
             object_memory,
             args.enable_qr,
-            args.robust_aruco
+            not args.fast_aruco
         )
         ball, ball_mask              = detect_ball(frame, args.ball_min_area)
 

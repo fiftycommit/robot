@@ -66,7 +66,7 @@ SPEED_MAX = 100
 
 ROBOT_ARUCO_ID = 67
 CAMERA_STATE_PORT = 8081
-CAMERA_STATE_MAX_AGE = 0.35
+CAMERA_STATE_MAX_AGE = 0.8
 CAMERA_SOCKET_TIMEOUT = 0.05
 CAMERA_ANGLE_OK = 8
 CAMERA_CONTACT_DIST = 23.0
@@ -184,6 +184,18 @@ def reset_scoop_position():
 
 def print_scoop_position():
     print("\r[PELLE] position={}       ".format(scoop_motor.position), end='')
+
+
+def speak_async(text):
+    def worker():
+        try:
+            sound.speak(text)
+        except Exception as exc:
+            print("\r\n[SON] ignore: {}".format(exc), flush=True)
+
+    t = threading.Thread(target=worker)
+    t.daemon = True
+    t.start()
 
 
 def read_distance(samples=3, delay=0.03):
@@ -816,7 +828,7 @@ def auto_thread():
                             stuck_count = 0
                         elif stuck_count >= MAX_STUCK_TRIES:
                             stop()
-                            sound.speak("Bloque")
+                            speak_async("Bloque")
                             print("\r\n[AUTO] >>> Bloque apres {} essais - AUTO OFF".format(stuck_count))
                             auto_mode = False
 
@@ -919,7 +931,8 @@ def motor_thread():
 def main():
     global running
 
-    sound.speak("Pret")
+    print("DEMARRAGE roboto.py", flush=True)
+    speak_async("Pret")
 
     print("ROBOT FOOTBALL")
     print("Z/Haut    : Avancer")
@@ -960,7 +973,7 @@ def main():
         running = False
         stop()
         scoop_motor.off(brake=True)
-        sound.speak("Arret")
+        speak_async("Arret")
         print("\nRobot arrete.")
 
         if turn_samples:
